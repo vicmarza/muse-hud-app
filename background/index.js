@@ -4802,7 +4802,11 @@
 
   // src/background/core/sources.ts
   var MUSE_ANDROID_PACKAGE = "com.facebook.aura";
-  var DEFAULT_RULES = [{ packageName: MUSE_ANDROID_PACKAGE, label: "Muse app" }];
+  var MUSE_BRIDGE_PACKAGE = "io.github.vicmarza.musebridge";
+  var DEFAULT_RULES = [
+    { packageName: MUSE_ANDROID_PACKAGE, label: "Muse app" },
+    { packageName: MUSE_BRIDGE_PACKAGE, label: "Muse Bridge" }
+  ];
   var MAX_TEXT_CHARS = 4000;
   function matchRule(n, rules) {
     const pkg = (n.packageName ?? "").toLowerCase();
@@ -4874,7 +4878,7 @@ ${text}`;
     minPageMs: 3000,
     lastPageHoldMs: 5000
   };
-  var STORAGE_KEYS = { settings: "settings", rules: "rules", history: "history" };
+  var STORAGE_KEYS = { settings: "settings", rules: "rules", history: "history", bridgeAdded: "bridgeAdded" };
   var HISTORY_LIMIT = 25;
   var RECENT_LIMIT = 20;
   var SNIPPET_CHARS = 80;
@@ -5010,6 +5014,14 @@ ${text}`;
         this.rules = rules.map(sanitizeRule).filter((r) => r !== null);
       if (Array.isArray(history))
         this.history = history.filter(isHistoryItem).slice(0, HISTORY_LIMIT);
+      if (Array.isArray(rules) && !await storage.get(STORAGE_KEYS.bridgeAdded)) {
+        const bridge = DEFAULT_RULES.find((r) => r.packageName === MUSE_BRIDGE_PACKAGE);
+        if (bridge && !this.rules.some((r) => sameRule(r, bridge))) {
+          this.rules = [...this.rules, bridge];
+          this.save(STORAGE_KEYS.rules, this.rules);
+        }
+        this.save(STORAGE_KEYS.bridgeAdded, true);
+      }
     }
     save(key, value) {
       this.session.storage.set(key, JSON.stringify(value)).catch((err) => {
