@@ -1,0 +1,31 @@
+{
+  "packageName": "io.github.vicmarza.musehud",
+  "version": "1.0.0",
+  "name": "Muse HUD",
+  "description": "Shows Meta Muse replies on your glasses. Ask Muse on your phone as usual; when it answers with a notification, the reply pages across the glasses display at your reading speed.",
+  "icon": "icon.png",
+  "type": "standard",
+  "sdkVersion": "0.3.0",
+  "minHostVersion": "1.42.0",
+  "entry": {
+    "background": "background/index.js",
+    "ui": "ui/index.html"
+  },
+  "permissions": [
+    {
+      "type": "READ_NOTIFICATIONS",
+      "description": "Reads Muse's notifications so its replies can be shown on your glasses"
+    }
+  ],
+  "hardwareRequirements": [
+    {
+      "type": "DISPLAY",
+      "level": "REQUIRED",
+      "description": "Shows Muse replies on the glasses"
+    }
+  ],
+  "bundle": {
+    "url": "bundle.zip",
+    "sha256": "26c199f8b8e680bbb3a923e3aa0dfe38b9fd0936a0e64c887202335266ea3532"
+  }
+}
