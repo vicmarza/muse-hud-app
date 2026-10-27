@@ -1,6 +1,6 @@
 {
   "packageName": "io.github.vicmarza.musehud",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Muse HUD",
   "description": "Shows Meta Muse replies on your glasses. Ask Muse on your phone as usual; when it answers with a notification, the reply pages across the glasses display at your reading speed.",
   "icon": "icon.png",
@@ -26,6 +26,6 @@
   ],
   "bundle": {
     "url": "bundle.zip",
-    "sha256": "02a0ce044de77a08a2df08005d8172fd283b8cdd3c283e6c204065b6b06cc229"
+    "sha256": "1b6023959dcf21b2ac4ca7da32ad9b220167b4ac602df1acbd0c0b9706578a50"
   }
 }

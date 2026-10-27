@@ -4855,20 +4855,27 @@
   class RecentTexts {
     ttlMs;
     seen = new Map;
-    constructor(ttlMs = 10 * 60 * 1000) {
+    constructor(ttlMs = 2 * 60 * 1000) {
       this.ttlMs = ttlMs;
     }
     isRepeat(packageName, text, now = Date.now()) {
       for (const [key, at] of this.seen)
         if (now - at > this.ttlMs)
           this.seen.delete(key);
-      const key = `${packageName.toLowerCase()}
-${text}`;
+      const key = `${packageName.toLowerCase()}|${fingerprint(text)}`;
       if (this.seen.has(key))
         return true;
       this.seen.set(key, now);
       return false;
     }
+  }
+  function fingerprint(text) {
+    let hash = 2166136261;
+    for (let i = 0;i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${text.length}:${(hash >>> 0).toString(16)}`;
   }
 
   // src/background/MuseHudController.ts
@@ -4878,10 +4885,9 @@ ${text}`;
     minPageMs: 3000,
     lastPageHoldMs: 5000
   };
-  var STORAGE_KEYS = { settings: "settings", rules: "rules", history: "history", bridgeAdded: "bridgeAdded" };
-  var HISTORY_LIMIT = 25;
-  var RECENT_LIMIT = 20;
-  var SNIPPET_CHARS = 80;
+  var STORAGE_KEYS = { settings: "settings", rules: "rules", bridgeAdded: "bridgeAdded" };
+  var LEGACY_HISTORY_KEY = "history";
+  var RECENT_LIMIT = 10;
   var G1_CANVAS = { width: 640, height: 200 };
   var TEST_TEXT = "Muse HUD is connected. When Muse answers with a phone notification, the reply shows up here, " + "one page at a time, at your reading speed.";
 
@@ -4889,7 +4895,7 @@ ${text}`;
     session;
     settings = { ...DEFAULT_SETTINGS };
     rules = [...DEFAULT_RULES];
-    history = [];
+    lastShown = null;
     recent = [];
     displayIssue = null;
     repeats = new RecentTexts;
@@ -4927,14 +4933,14 @@ ${text}`;
         this.broadcast();
         return;
       }
-      this.addHistory({ id: crypto.randomUUID(), receivedAt: Date.now(), source: rule.label, text });
+      this.lastShown = { at: Date.now(), source: rule.label };
       this.pager.show(text);
     }
     snapshot() {
       return {
         settings: this.settings,
         rules: this.rules,
-        history: this.history,
+        lastShown: this.lastShown,
         recent: this.recent.map((r) => ({ ...r, matched: matchRule(r, this.rules)?.label ?? null })),
         showing: this.pager.showing,
         canReadNotifications: this.session.phone.notifications.hasPermission,
@@ -4964,14 +4970,6 @@ ${text}`;
         this.rules = [...DEFAULT_RULES];
         this.save(STORAGE_KEYS.rules, this.rules);
         this.broadcast();
-      }), ui.on("history:replay", ({ id }) => {
-        const item = this.history.find((h) => h.id === id);
-        if (item)
-          this.pager.show(item.text);
-      }), ui.on("history:clear", () => {
-        this.history = [];
-        this.save(STORAGE_KEYS.history, this.history);
-        this.broadcast();
       }), ui.on("glasses:test", () => void this.pager.show(TEST_TEXT)), ui.on("glasses:stop", () => this.pager.stop()));
     }
     broadcast() {
@@ -4979,20 +4977,14 @@ ${text}`;
         this.session.ui.send("state", this.snapshot());
     }
     remember(n) {
-      const body = (n.content ?? "").replace(/\s+/g, " ").trim();
       const entry = {
         receivedAt: Date.now(),
         app: n.app || n.packageName || "Unknown app",
         packageName: n.packageName ?? "",
         title: n.title ?? "",
-        snippet: body.length > SNIPPET_CHARS ? body.slice(0, SNIPPET_CHARS - 3) + "..." : body,
         matched: null
       };
       this.recent = [entry, ...this.recent].slice(0, RECENT_LIMIT);
-    }
-    addHistory(item) {
-      this.history = [item, ...this.history].slice(0, HISTORY_LIMIT);
-      this.save(STORAGE_KEYS.history, this.history);
     }
     canvas() {
       const d = this.session.capabilities?.display;
@@ -5003,18 +4995,17 @@ ${text}`;
     }
     async load() {
       const storage = this.session.storage;
-      const [settings, rules, history] = await Promise.all([
+      const [settings, rules, bridgeAdded] = await Promise.all([
         readJson(storage.get(STORAGE_KEYS.settings)),
         readJson(storage.get(STORAGE_KEYS.rules)),
-        readJson(storage.get(STORAGE_KEYS.history))
+        readJson(storage.get(STORAGE_KEYS.bridgeAdded))
       ]);
       if (settings && typeof settings === "object")
         this.settings = sanitizeSettings({ ...DEFAULT_SETTINGS, ...settings });
       if (Array.isArray(rules))
         this.rules = rules.map(sanitizeRule).filter((r) => r !== null);
-      if (Array.isArray(history))
-        this.history = history.filter(isHistoryItem).slice(0, HISTORY_LIMIT);
-      if (Array.isArray(rules) && !await storage.get(STORAGE_KEYS.bridgeAdded)) {
+      storage.delete(LEGACY_HISTORY_KEY).catch(() => {});
+      if (Array.isArray(rules) && !bridgeAdded) {
         const bridge = DEFAULT_RULES.find((r) => r.packageName === MUSE_BRIDGE_PACKAGE);
         if (bridge && !this.rules.some((r) => sameRule(r, bridge))) {
           this.rules = [...this.rules, bridge];
@@ -5047,10 +5038,6 @@ ${text}`;
     const titleIncludes = typeof r.titleIncludes === "string" && r.titleIncludes.trim() ? r.titleIncludes.trim() : undefined;
     const label = typeof r.label === "string" && r.label.trim() ? r.label.trim() : packageName;
     return titleIncludes ? { packageName, titleIncludes, label } : { packageName, label };
-  }
-  function isHistoryItem(x) {
-    const h = x;
-    return !!h && typeof h.id === "string" && typeof h.text === "string" && typeof h.receivedAt === "number";
   }
   function clamp(value, min, max, fallback) {
     const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
