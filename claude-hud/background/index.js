@@ -5051,6 +5051,7 @@
   class Transcript {
     lines = [];
     current = "";
+    lastAt = Number.NEGATIVE_INFINITY;
     get interim() {
       return this.current;
     }
@@ -5063,7 +5064,8 @@
       this.current = "";
       if (!clean)
         return null;
-      const line = { at: now, text: clean };
+      const line = { at: Math.max(now, this.lastAt + 1), text: clean };
+      this.lastAt = line.at;
       this.lines.push(line);
       this.prune(now);
       return line;
@@ -5074,6 +5076,9 @@
     }
     tail(n) {
       return this.lines.slice(-n);
+    }
+    restore(lines) {
+      this.lines = [...lines, ...this.lines].sort((a, b) => a.at - b.at);
     }
     all() {
       return [...this.lines];
@@ -5149,6 +5154,20 @@
     return doc.lines.map((l) => `${clock(l.at, doc.utcOffsetMin)} ${l.text}`).join(`
 `);
   }
+  function numberedTranscript(doc) {
+    return doc.lines.map((l, i) => `[${i + 1}] ${clock(l.at, doc.utcOffsetMin)} ${l.text}`).join(`
+`);
+  }
+  function splitExport(doc, firstLines) {
+    const starts = firstLines.map((n) => n - 1);
+    return starts.map((start, i) => {
+      const end = i + 1 < starts.length ? starts[i + 1] : doc.lines.length;
+      const lines = doc.lines.slice(start, end);
+      const until = end < doc.lines.length ? doc.lines[end].at : Infinity;
+      const replies = doc.replies.filter((r) => r.at < until);
+      return buildExport(lines, replies, doc.utcOffsetMin);
+    });
+  }
   function exportText(doc) {
     const parts = [doc.title, doc.about, ""];
     if (doc.replies.length) {
@@ -5202,13 +5221,9 @@
   function notionPage(doc, notes, schema) {
     const blocks = [];
     if (notes) {
-      blocks.push(block("heading_2", text("Summary")));
-      if (notes.summary)
-        blocks.push(block("paragraph", text(notes.summary)));
-      section(blocks, "Key points", notes.keyPoints, "bulleted_list_item");
-      section(blocks, "Decisions", notes.decisions, "bulleted_list_item");
       section(blocks, "Action items", notes.actionItems, "to_do");
-      section(blocks, "Open questions", notes.openQuestions, "bulleted_list_item");
+      for (const topic of notes.topics)
+        section(blocks, topic.heading, topic.points, "bulleted_list_item");
     }
     section(blocks, "Claude on the glasses", doc.replies.map((r) => replyLine(r, doc.utcOffsetMin)), "bulleted_list_item");
     blocks.push(block("paragraph", text(doc.about, { color: "gray" })));
@@ -5225,7 +5240,7 @@
       return;
     blocks.push(block("heading_3", text(heading)));
     for (const item of items)
-      blocks.push(block(type, text(item), type === "to_do" ? { checked: false } : {}));
+      blocks.push(block(type, boldText(item), type === "to_do" ? { checked: false } : {}));
   }
   function pageProperties(doc, notes) {
     const title = notes ? `${notes.title}, ${dateLabel(doc.start, doc.utcOffsetMin)}` : doc.title;
@@ -5250,14 +5265,20 @@
       if (notes.tags.length)
         set(PROPERTIES.tags, { multi_select: notes.tags.map((name) => ({ name })) });
       if (notes.actionItems.length) {
-        set(PROPERTIES.actionItems, { rich_text: text(notes.actionItems.map((a) => `• ${a}`).join(`
-`)) });
+        const items = notes.actionItems.map((a) => `• ${a.replace(/\*\*/g, "")}`).join(`
+`);
+        set(PROPERTIES.actionItems, { rich_text: text(items) });
       }
     }
     return props;
   }
   function block(type, richText, extra = {}) {
     return { object: "block", type, [type]: { rich_text: richText, ...extra } };
+  }
+  function boldText(content) {
+    const parts = content.split(/(\*\*[^*]+\*\*)/).filter(Boolean);
+    const rich = parts.flatMap((part) => part.startsWith("**") && part.endsWith("**") && part.length > 4 ? text(part.slice(2, -2), { bold: true }) : text(part));
+    return rich.length ? rich : text(content);
   }
   function text(content, annotations) {
     const pieces = [];
@@ -5297,8 +5318,10 @@
       try {
         const db = await this.call(token, "GET", `/databases/${id}`);
         const source = db.data_sources?.[0];
-        if (source)
-          return { kind: "database", id: source.id, title: plainText(db.title) || source.name || "Untitled" };
+        if (source) {
+          const title = plainText(db.title) || source.name || "Untitled";
+          return { kind: "database", id: source.id, title, ...db.url ? { url: db.url } : {} };
+        }
       } catch (err) {
         if (!(err instanceof NotionError) || err.kind !== "not_found" && err.kind !== "bad_request")
           throw err;
@@ -5487,61 +5510,86 @@ ${transcriptBlock(transcript)}` };
   var NOTES_SCHEMA = {
     type: "object",
     properties: {
-      title: { type: "string" },
-      summary: { type: "string" },
-      tags: stringList,
-      key_points: stringList,
-      decisions: stringList,
-      action_items: stringList,
-      open_questions: stringList
+      conversations: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            first_line: { type: "integer" },
+            last_line: { type: "integer" },
+            title: { type: "string" },
+            summary: { type: "string" },
+            tags: stringList,
+            action_items: stringList,
+            topics: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { heading: { type: "string" }, points: stringList },
+                required: ["heading", "points"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["first_line", "last_line", "title", "summary", "tags", "action_items", "topics"],
+          additionalProperties: false
+        }
+      }
     },
-    required: ["title", "summary", "tags", "key_points", "decisions", "action_items", "open_questions"],
+    required: ["conversations"],
     additionalProperties: false
   };
   function notesPrompt(transcript, replies, tags, context) {
     const tagRule = tags.length ? `one to three, taken from the existing tags when one fits (${tags.join(", ")}); add a new tag only when none fits, in one or two words styled like the others` : "one to three, one or two words each";
-    const system = `You turn a conversation heard through the wearer's smart glasses into notes for their Notion, where they come back to it later. Write for the wearer, an expert who wants the substance fast.
+    const system = `You turn what the wearer's smart glasses heard into meeting notes for their Notion, in the style of Notion's AI meeting notes. The wearer comes back to them later and wants the substance fast.
 
-- title: the main topic in 3 to 8 words. No date, and no "Conversation about".
+The transcript may hold more than one conversation: a meeting, then a chat in the hallway, then a phone call. Start a new conversation where the people, the setting or the purpose change, typically after a pause and a change of subject. A new subject within the same discussion is a new topic, not a new conversation. For each conversation:
+
+- first_line, last_line: the numbers of its first and last lines. Together, the conversations cover every line, in order.
+- title: its main subject in 3 to 8 words. No date, and no "Conversation about".
 - summary: one or two sentences on what it was about and where it ended up.
 - tags: ${tagRule}.
-- key_points: the facts, numbers and arguments worth keeping.
-- decisions: what was agreed.
-- action_items: who does what, starting with a verb; name the person when the transcript says who.
-- open_questions: what was left unanswered.
+- action_items: who does what and by when, as said, in the form "Victor to send the budget template by Friday". When the transcript doesn't say who, start with the verb.
+- topics: what was discussed, grouped by subject in the order it came up. Each has a short heading and two to six points. Start a point with a bold key term and a colon when that helps scanning, as in **Budget**: in-kind must be 40%; otherwise write a plain sentence. Keep the facts, numbers, dates, names, decisions and open questions.
 
-Short sentences, plain text. Leave a list empty when there is nothing for it, and keep to what the transcript supports.
+Correct obvious recognition errors, write plain sentences, and keep to what the transcript supports. A conversation too thin for topics gets an empty list.
 
 ${TRANSCRIPT}${about(context)}`;
-    const shown = replies.length ? `What you showed on the glasses during it:
+    const shown = replies.length ? `What you showed on the glasses meanwhile:
 ${replies.map((r) => `- ${r}`).join(`
 `)}
 
 ` : "";
-    return { system, user: `${shown}The conversation, oldest first:
+    return { system, user: `${shown}What the glasses heard, oldest first:
 ${transcriptBlock(transcript)}` };
   }
-  function parseNotes(reply) {
+  function parseNotes(reply, lineCount) {
     let raw;
     try {
       raw = JSON.parse(reply);
     } catch {
       return null;
     }
-    const text = (v) => typeof v === "string" ? cleanText(v) : "";
-    const list = (v) => Array.isArray(v) ? v.map(text).filter(Boolean) : [];
-    const title = text(raw.title);
-    if (!title)
+    if (!Array.isArray(raw.conversations) || lineCount < 1)
       return null;
-    return {
-      title,
-      summary: text(raw.summary),
-      tags: list(raw.tags).map((t) => t.replace(/\s*,\s*/g, " ").trim()).filter(Boolean).slice(0, 3),
-      keyPoints: list(raw.key_points),
-      decisions: list(raw.decisions),
-      actionItems: list(raw.action_items),
-      openQuestions: list(raw.open_questions)
-    };
+    const plain = (v) => typeof v === "string" ? cleanText(v) : "";
+    const point = (v) => typeof v === "string" ? v.replace(/\s+/g, " ").replace(/^[-*•]\s+/, "").trim() : "";
+    const list = (v, f) => Array.isArray(v) ? v.map(f).filter(Boolean) : [];
+    const parsed = raw.conversations.map((c) => ({
+      firstLine: Math.min(lineCount, Math.max(1, Math.round(Number(c?.first_line) || 1))),
+      title: plain(c?.title),
+      summary: plain(c?.summary),
+      tags: list(c?.tags, plain).map((t) => t.replace(/\s*,\s*/g, " ")).slice(0, 3),
+      actionItems: list(c?.action_items, point),
+      topics: (Array.isArray(c?.topics) ? c.topics : []).map((t) => ({ heading: plain(t?.heading), points: list(t?.points, point) })).filter((t) => t.heading && t.points.length)
+    })).filter((c) => c.title).sort((a, b) => a.firstLine - b.firstLine).filter((c, i, all) => i === 0 || c.firstLine !== all[i - 1].firstLine);
+    if (!parsed.length)
+      return null;
+    return parsed.map((c, i) => ({
+      ...c,
+      firstLine: i === 0 ? 1 : c.firstLine,
+      lastLine: i + 1 < parsed.length ? parsed[i + 1].firstLine - 1 : lineCount
+    }));
   }
 
   // src/background/core/wake.ts
@@ -5576,9 +5624,18 @@ ${transcriptBlock(transcript)}` };
     questionEffort: "low",
     context: "",
     summarizeExports: true,
+    autoSave: true,
+    autoSaveQuietMin: 5,
     ...DEFAULT_PAGING
   };
-  var STORAGE_KEYS = { settings: "settings", apiKey: "apiKey", replies: "replies", usage: "usage", notion: "notion" };
+  var STORAGE_KEYS = {
+    settings: "settings",
+    apiKey: "apiKey",
+    replies: "replies",
+    usage: "usage",
+    notion: "notion",
+    utcOffsetMin: "utcOffsetMin"
+  };
   var REPLY_LIMIT = 25;
   var TRANSCRIPT_TAIL = 12;
   var CONTEXT_CHARS = 600;
@@ -5591,6 +5648,9 @@ ${transcriptBlock(transcript)}` };
   var EARLIER_INSIGHTS = 6;
   var UI_INTERIM_THROTTLE_MS = 400;
   var NOTES_TIMEOUT_MS = 120000;
+  var AUTO_SAVE_MIN_WORDS = 30;
+  var AUTO_SAVE_MAX_SPAN_MS = 2.5 * 60 * 60 * 1000;
+  var AUTO_SAVE_RETRY_MS = 5 * 60 * 1000;
   var STATUS_LISTENING = "Claude is listening…";
   var STATUS_THINKING = "Claude is thinking…";
   var TEST_TEXT = "Claude HUD is connected. Say “Claude,” then your question, and the answer shows up here. " + "Insights from the conversation appear on their own.";
@@ -5619,6 +5679,10 @@ ${transcriptBlock(transcript)}` };
     notion = null;
     notionCheck = null;
     exportStatus = null;
+    saving = false;
+    savedThrough = 0;
+    autoSaveRetryAt = 0;
+    phoneUtcOffset = null;
     unsubs = [];
     stopTranscription = null;
     tickTimer = null;
@@ -5655,7 +5719,11 @@ ${transcriptBlock(transcript)}` };
       await this.load();
       this.registerUi();
       this.applyListening();
-      this.unsubs.push(this.session.onBeforeDisconnect(() => this.stop()));
+      this.unsubs.push(this.session.onBeforeDisconnect(() => {
+        if (this.settings.autoSave && this.notion)
+          this.saveToNotion(this.utcOffsetMin(), true);
+        this.stop();
+      }));
       this.scheduleTick();
       console.log(`Claude HUD: started (listening=${this.settings.listening}, key=${this.apiKey ? "set" : "missing"})`);
     }
@@ -5790,6 +5858,7 @@ ${transcriptBlock(transcript)}` };
     scheduleTick() {
       this.tickTimer = this.deps.scheduler.set(() => {
         this.maybeCheckInsight();
+        this.maybeAutoSave();
         this.scheduleTick();
       }, TICK_MS);
     }
@@ -5842,8 +5911,7 @@ ${transcriptBlock(transcript)}` };
       return this.asking > 0 || this.capture !== null || this.showingKind === "question" || this.showingKind === "brief";
     }
     exportDoc(utcOffsetMin) {
-      const offset = Number.isFinite(utcOffsetMin) ? clamp(utcOffsetMin, -14 * 60, 14 * 60, 0) : 0;
-      const doc = buildExport(this.transcript.all(), this.replies, offset);
+      const doc = buildExport(this.transcript.all(), this.replies, sanitizeOffset(utcOffsetMin));
       if (!doc)
         this.setExportStatus({ busy: false, ok: false, message: "Nothing heard yet, so there's nothing to export." });
       return doc;
@@ -5864,34 +5932,75 @@ ${transcriptBlock(transcript)}` };
         this.setExportStatus({ busy: false, ok: false, message: "The share sheet didn't open." });
       }
     }
-    async saveToNotion(utcOffsetMin) {
-      const notion = this.notion;
-      if (!notion) {
+    unsavedLines() {
+      return this.transcript.all().filter((l) => l.at > this.savedThrough);
+    }
+    async saveToNotion(utcOffsetMin, auto = false) {
+      if (!this.notion) {
         this.setExportStatus({ busy: false, ok: false, message: "Connect Notion first, under Notion below." });
         return;
       }
-      if (this.exportStatus?.busy)
+      if (this.saving)
         return;
-      const doc = this.exportDoc(utcOffsetMin);
-      if (!doc)
+      const doc = buildExport(this.unsavedLines(), this.replies, sanitizeOffset(utcOffsetMin));
+      if (!doc) {
+        const message = this.transcript.isEmpty ? "Nothing heard yet, so there's nothing to save." : "Everything heard is already in Notion.";
+        this.setExportStatus({ busy: false, ok: true, message });
+        return;
+      }
+      await this.saveDoc(doc, auto);
+    }
+    async saveDoc(doc, auto, restoreOnFailure = false) {
+      const notion = this.notion;
+      if (!notion)
         return;
       const { token, target } = notion;
+      this.saving = true;
       this.setExportStatus({ busy: true, ok: true, message: "Saving to Notion…" });
+      const titles = [];
+      let firstUrl;
+      let parts = [doc];
       try {
         const schema = target.kind === "database" ? await this.notionClient.schema(token, target.id) : null;
         const { notes, issue } = await this.writeNotes(doc, schema?.options[PROPERTIES.tags.name] ?? []);
-        this.setExportStatus({ busy: true, ok: true, message: "Saving to Notion…" });
-        const url = await this.notionClient.createPage(token, target, notionPage(doc, notes, schema), (saved, total) => {
-          if (total > BLOCKS_PER_REQUEST && saved < total) {
-            this.setExportStatus({ busy: true, ok: true, message: `Saving to Notion… ${Math.round(saved / total * 100)}%` });
-          }
-        });
+        if (notes)
+          parts = splitExport(doc, notes.map((n) => n.firstLine));
+        for (const [i, part] of parts.entries()) {
+          const progress = parts.length > 1 ? `Saving ${i + 1} of ${parts.length} to Notion…` : "Saving to Notion…";
+          this.setExportStatus({ busy: true, ok: true, message: progress });
+          const page = notionPage(part, notes?.[i] ?? null, schema);
+          const url = await this.notionClient.createPage(token, target, page, (saved, total) => {
+            if (total > BLOCKS_PER_REQUEST && saved < total) {
+              this.setExportStatus({ busy: true, ok: true, message: `${progress} ${Math.round(saved / total * 100)}%` });
+            }
+          });
+          firstUrl ??= url;
+          titles.push(notes?.[i]?.title ?? part.title);
+          this.savedThrough = Math.max(this.savedThrough, part.end);
+        }
         const where = target.kind === "database" ? `the “${target.title}” database` : `“${target.title}”`;
-        const saved = `Saved “${notes?.title ?? doc.title}” to ${where}.`;
-        this.setExportStatus({ busy: false, ok: true, message: issue ? `${saved} Without Claude's notes: ${issue}` : saved, url });
+        const what = titles.length === 1 ? `“${titles[0]}”` : `${titles.length} conversations, ${titles.map((t) => `“${t}”`).join(", ")},`;
+        const saved = `${auto ? "Saved automatically" : "Saved"} ${what} to ${where}.`;
+        const url = titles.length === 1 ? firstUrl : target.url ?? firstUrl;
+        this.autoSaveRetryAt = 0;
+        this.setExportStatus({
+          busy: false,
+          ok: true,
+          message: issue ? `${saved} Without Claude's notes: ${issue}` : saved,
+          ...url ? { url } : {}
+        });
       } catch (err) {
-        const url = err instanceof NotionError ? err.url : undefined;
-        this.setExportStatus({ busy: false, ok: false, message: notionErrorText(err), ...url ? { url } : {} });
+        const reason = notionErrorText(err);
+        const message = titles.length ? `Saved ${titles.length} of ${parts.length}, then: ${reason}` : reason;
+        const url = (err instanceof NotionError ? err.url : undefined) ?? firstUrl;
+        if (auto)
+          this.autoSaveRetryAt = this.deps.now() + AUTO_SAVE_RETRY_MS;
+        if (restoreOnFailure)
+          this.transcript.restore(doc.lines.filter((l) => l.at > this.savedThrough));
+        this.setExportStatus({ busy: false, ok: false, message, ...url ? { url } : {} });
+      } finally {
+        this.saving = false;
+        this.broadcast();
       }
     }
     async writeNotes(doc, tags) {
@@ -5902,7 +6011,7 @@ ${transcriptBlock(transcript)}` };
         return { notes: null, issue: "no Claude API key is saved." };
       this.setExportStatus({ busy: true, ok: true, message: "Claude is writing the notes…" });
       const replies = doc.replies.map((r) => replyLine(r, doc.utcOffsetMin));
-      const prompt = notesPrompt(transcriptText(doc), replies, tags, this.settings.context);
+      const prompt = notesPrompt(numberedTranscript(doc), replies, tags, this.settings.context);
       try {
         const reply = await this.client.ask(apiKey, {
           ...prompt,
@@ -5913,13 +6022,40 @@ ${transcriptBlock(transcript)}` };
           timeoutMs: NOTES_TIMEOUT_MS
         }, 1);
         this.countUsage(reply.inputTokens, reply.outputTokens);
-        const notes = parseNotes(reply.text);
+        const notes = parseNotes(reply.text, doc.lines.length);
         return notes ? { notes, issue: null } : { notes: null, issue: "Claude's notes came back in an unexpected shape." };
       } catch (err) {
         if (err instanceof ClaudeError && err.kind === "auth")
           this.keyRejected = true;
         return { notes: null, issue: errorText(err) };
       }
+    }
+    maybeAutoSave() {
+      if (!this.settings.autoSave || !this.notion || this.saving)
+        return;
+      const now = this.deps.now();
+      if (now < this.autoSaveRetryAt)
+        return;
+      const lines = this.unsavedLines();
+      if (lines.reduce((n, l) => n + countWords(l.text), 0) < AUTO_SAVE_MIN_WORDS)
+        return;
+      const quiet = now - lines[lines.length - 1].at >= this.settings.autoSaveQuietMin * 60000;
+      const aging = now - lines[0].at >= AUTO_SAVE_MAX_SPAN_MS;
+      if (quiet || aging)
+        this.saveToNotion(this.utcOffsetMin(), true);
+    }
+    clearTranscript() {
+      const unsaved = buildExport(this.unsavedLines(), this.replies, this.utcOffsetMin());
+      const save = this.settings.autoSave && this.notion && !this.saving && unsaved && unsaved.words >= AUTO_SAVE_MIN_WORDS;
+      this.transcript.clear();
+      this.cancelCapture();
+      this.exportStatus = null;
+      this.broadcast();
+      if (save)
+        this.saveDoc(unsaved, true, true);
+    }
+    utcOffsetMin() {
+      return this.phoneUtcOffset ?? new Date().getTimezoneOffset();
     }
     async connectNotion(token, pageLink) {
       const clean = (token ?? "").trim();
@@ -5970,6 +6106,7 @@ ${transcriptBlock(transcript)}` };
         transcript: this.transcript.tail(TRANSCRIPT_TAIL),
         interim: this.transcript.interim,
         heardLines: this.transcript.length,
+        unsavedLines: this.notion ? this.unsavedLines().length : 0,
         notion: {
           title: this.notion?.target.title ?? null,
           kind: this.notion?.target.kind ?? null,
@@ -6029,11 +6166,11 @@ ${transcriptBlock(transcript)}` };
         this.keyRejected = false;
         this.session.storage.delete(STORAGE_KEYS.apiKey).catch(() => {});
         this.broadcast();
-      }), ui.on("key:check", () => void this.checkKey()), ui.on("ask", ({ question }) => void this.ask(question)), ui.on("brief", () => void this.brief()), ui.on("transcript:clear", () => {
-        this.transcript.clear();
-        this.cancelCapture();
-        this.exportStatus = null;
-        this.broadcast();
+      }), ui.on("key:check", () => void this.checkKey()), ui.on("ask", ({ question }) => void this.ask(question)), ui.on("brief", () => void this.brief()), ui.on("transcript:clear", () => this.clearTranscript()), ui.on("clock", ({ utcOffsetMin }) => {
+        if (!Number.isFinite(utcOffsetMin))
+          return;
+        this.phoneUtcOffset = sanitizeOffset(utcOffsetMin);
+        this.save(STORAGE_KEYS.utcOffsetMin, this.phoneUtcOffset);
       }), ui.on("export:share", ({ utcOffsetMin }) => void this.shareTranscript(utcOffsetMin)), ui.on("export:notion", ({ utcOffsetMin }) => void this.saveToNotion(utcOffsetMin)), ui.on("notion:connect", ({ token, pageLink }) => void this.connectNotion(token, pageLink)), ui.on("notion:check", () => {
         if (this.notion)
           this.verifyNotion(this.notion.token, this.notion.linkId);
@@ -6098,12 +6235,13 @@ ${transcriptBlock(transcript)}` };
     }
     async load() {
       const storage = this.session.storage;
-      const [settings, apiKey, replies, usage, notion] = await Promise.all([
+      const [settings, apiKey, replies, usage, notion, utcOffsetMin] = await Promise.all([
         readJson(storage.get(STORAGE_KEYS.settings)),
         storage.get(STORAGE_KEYS.apiKey).catch(() => null),
         readJson(storage.get(STORAGE_KEYS.replies)),
         readJson(storage.get(STORAGE_KEYS.usage)),
-        readJson(storage.get(STORAGE_KEYS.notion))
+        readJson(storage.get(STORAGE_KEYS.notion)),
+        readJson(storage.get(STORAGE_KEYS.utcOffsetMin))
       ]);
       if (settings && typeof settings === "object")
         this.settings = sanitizeSettings({ ...DEFAULT_SETTINGS, ...settings });
@@ -6114,6 +6252,8 @@ ${transcriptBlock(transcript)}` };
       if (isUsage(usage))
         this.usage = usage;
       this.notion = notionConnection(notion);
+      if (typeof utcOffsetMin === "number")
+        this.phoneUtcOffset = sanitizeOffset(utcOffsetMin);
     }
     save(key, value) {
       this.session.storage.set(key, JSON.stringify(value)).catch((err) => {
@@ -6131,8 +6271,13 @@ ${transcriptBlock(transcript)}` };
       questionEffort: EFFORTS.includes(s.questionEffort) ? s.questionEffort : DEFAULT_SETTINGS.questionEffort,
       context: typeof s.context === "string" ? s.context.slice(0, CONTEXT_CHARS) : "",
       summarizeExports: s.summarizeExports !== false,
+      autoSave: s.autoSave !== false,
+      autoSaveQuietMin: clamp(s.autoSaveQuietMin, 1, 30, DEFAULT_SETTINGS.autoSaveQuietMin),
       ...sanitizePaging(s)
     };
+  }
+  function sanitizeOffset(utcOffsetMin) {
+    return Number.isFinite(utcOffsetMin) ? clamp(utcOffsetMin, -14 * 60, 14 * 60, 0) : 0;
   }
   function endsQuestion(text) {
     return /\?["”']?$/.test(text.trim());
