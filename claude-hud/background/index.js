@@ -4960,14 +4960,13 @@
         max_tokens: opts.maxTokens,
         system: opts.system,
         messages: [{ role: "user", content: opts.user }],
-        output_config: { effort: opts.effort },
+        output_config: {
+          effort: opts.effort,
+          ...opts.jsonSchema ? { format: { type: "json_schema", schema: opts.jsonSchema } } : {}
+        },
         ...withFallbacks ? { fallbacks: "default" } : {}
       };
-      const { status, body: raw } = await this.request(`${API_BASE}/messages`, {
-        method: "POST",
-        headers: this.headers(apiKey, withFallbacks),
-        body: JSON.stringify(body)
-      });
+      const { status, body: raw } = await this.request(`${API_BASE}/messages`, { method: "POST", headers: this.headers(apiKey, withFallbacks), body: JSON.stringify(body) }, opts.timeoutMs);
       if (status !== 200) {
         const err = errorFor(status, raw);
         if (withFallbacks && err.kind === "bad_request" && /fallback|beta/i.test(err.message)) {
@@ -4986,9 +4985,9 @@
         ...fallbackBeta ? { "anthropic-beta": FALLBACK_BETA } : {}
       };
     }
-    async request(url, init) {
+    async request(url, init, timeoutMs) {
       try {
-        return await send(this.deps, url, init);
+        return await send(timeoutMs ? { ...this.deps, timeoutMs } : this.deps, url, init);
       } catch (err) {
         if (err instanceof TransportError && err.kind === "timeout") {
           throw new ClaudeError("timeout", "Claude took too long to answer.");
@@ -5042,272 +5041,6 @@
     if (status >= 500)
       return new ClaudeError("server", "The Claude API had an error.", status);
     return new ClaudeError("bad_request", message ? `Claude API: ${message}` : `Claude API error ${status}.`, status);
-  }
-
-  // src/background/core/export.ts
-  var REPLY_GRACE_MS = 10 * 60 * 1000;
-  var KIND_NAMES = { question: "Answer", insight: "Insight", brief: "Brief" };
-  var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  function buildExport(lines, replies, utcOffsetMin) {
-    if (lines.length === 0)
-      return null;
-    const start = lines[0].at;
-    const end = lines[lines.length - 1].at;
-    const minutes = Math.max(1, Math.round((end - start) / 60000));
-    return {
-      title: `Conversation, ${dateLabel(start, utcOffsetMin)}, ${clock(start, utcOffsetMin)}`,
-      about: `Transcribed by Claude HUD from ${clock(start, utcOffsetMin)} to ${clock(end, utcOffsetMin)} (${minutes} min).`,
-      replies: replies.filter((r) => r.at >= start && r.at <= end + REPLY_GRACE_MS).sort((a, b) => a.at - b.at),
-      lines,
-      utcOffsetMin
-    };
-  }
-  function replyLine(r, utcOffsetMin) {
-    const head = `${KIND_NAMES[r.kind]}, ${clock(r.at, utcOffsetMin)}`;
-    return r.question ? `${head}. Q: ${r.question} A: ${r.text}` : `${head}: ${r.text}`;
-  }
-  function exportText(doc) {
-    const parts = [doc.title, doc.about, ""];
-    if (doc.replies.length) {
-      parts.push("Claude", ...doc.replies.map((r) => `- ${replyLine(r, doc.utcOffsetMin)}`), "");
-    }
-    parts.push("Transcript", ...doc.lines.map((l) => `${clock(l.at, doc.utcOffsetMin)} ${l.text}`));
-    return parts.join(`
-`);
-  }
-  function clock(ms, utcOffsetMin) {
-    const d = new Date(ms - utcOffsetMin * 60000);
-    return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-  }
-  function dateLabel(ms, utcOffsetMin) {
-    const d = new Date(ms - utcOffsetMin * 60000);
-    return `${DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
-  }
-  function pad(n) {
-    return n < 10 ? `0${n}` : String(n);
-  }
-
-  // src/background/core/notion.ts
-  var NOTION_API = "https://api.notion.com/v1";
-  var NOTION_VERSION = "2025-09-03";
-  var BLOCKS_PER_REQUEST = 100;
-  var RICH_TEXT_CHARS = 2000;
-  var RETRIES = 2;
-  function parsePageId(link) {
-    const trimmed = link.trim();
-    const peek = /[?&]p=([0-9a-f]{32})\b/i.exec(trimmed);
-    let hex = peek?.[1];
-    if (!hex) {
-      const path = trimmed.split(/[?#]/)[0].replace(/-/g, "");
-      const all = path.match(/[0-9a-f]{32}(?![0-9a-f])/gi);
-      hex = all?.[all.length - 1];
-    }
-    if (!hex)
-      return null;
-    const h = hex.toLowerCase();
-    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
-  }
-  function notionBlocks(doc) {
-    const blocks = [block("paragraph", text(doc.about, { color: "gray" }))];
-    if (doc.replies.length) {
-      blocks.push(block("heading_2", text("Claude")));
-      for (const r of doc.replies)
-        blocks.push(block("bulleted_list_item", text(replyLine(r, doc.utcOffsetMin))));
-    }
-    blocks.push(block("heading_2", text("Transcript")));
-    for (const line of doc.lines) {
-      blocks.push(block("paragraph", [...text(`${clock(line.at, doc.utcOffsetMin)}  `, { color: "gray" }), ...text(line.text)]));
-    }
-    return blocks;
-  }
-  function block(type, richText) {
-    return { object: "block", type, [type]: { rich_text: richText } };
-  }
-  function text(content, annotations) {
-    const pieces = [];
-    for (let i = 0;i < content.length || i === 0; i += RICH_TEXT_CHARS) {
-      pieces.push({
-        type: "text",
-        text: { content: content.slice(i, i + RICH_TEXT_CHARS) },
-        ...annotations ? { annotations } : {}
-      });
-    }
-    return pieces;
-  }
-
-  class NotionError extends Error {
-    kind;
-    url;
-    constructor(kind, message, url) {
-      super(message);
-      this.kind = kind;
-      this.url = url;
-      this.name = "NotionError";
-    }
-    get retryable() {
-      return this.kind === "rate_limit" || this.kind === "server" || this.kind === "network" || this.kind === "timeout";
-    }
-  }
-
-  class NotionClient {
-    deps;
-    constructor(deps) {
-      this.deps = deps;
-    }
-    async pageTitle(token, pageId) {
-      const page = await this.call(token, "GET", `/pages/${pageId}`);
-      const titleProp = Object.values(page.properties ?? {}).find((p) => p.type === "title");
-      return (titleProp?.title ?? []).map((t) => t.plain_text ?? "").join("").trim() || "Untitled";
-    }
-    async createPage(token, parentId, title, blocks, onProgress) {
-      const first = blocks.slice(0, BLOCKS_PER_REQUEST);
-      const page = await this.call(token, "POST", "/pages", {
-        parent: { page_id: parentId },
-        properties: { title: { title: [{ type: "text", text: { content: title } }] } },
-        children: first
-      });
-      const id = page.id ?? "";
-      const url = page.url ?? `https://www.notion.so/${id.replace(/-/g, "")}`;
-      onProgress?.(first.length, blocks.length);
-      for (let i = BLOCKS_PER_REQUEST;i < blocks.length; i += BLOCKS_PER_REQUEST) {
-        const batch = blocks.slice(i, i + BLOCKS_PER_REQUEST);
-        try {
-          await this.call(token, "PATCH", `/blocks/${id}/children`, { children: batch });
-        } catch (err) {
-          const reason = err instanceof NotionError ? err.message : "Notion stopped answering.";
-          throw new NotionError("server", `Saved part of it (${i} of ${blocks.length} blocks). ${reason}`, url);
-        }
-        onProgress?.(i + batch.length, blocks.length);
-      }
-      return url;
-    }
-    async call(token, method, path, body) {
-      for (let attempt = 0;; attempt++) {
-        try {
-          return await this.once(token, method, path, body);
-        } catch (err) {
-          if (!(err instanceof NotionError) || !err.retryable || attempt >= RETRIES)
-            throw err;
-          await sleep(this.deps.scheduler, 1000 * (attempt + 1));
-        }
-      }
-    }
-    async once(token, method, path, body) {
-      let response;
-      try {
-        response = await send(this.deps, `${NOTION_API}${path}`, {
-          method,
-          headers: {
-            authorization: `Bearer ${token}`,
-            "notion-version": NOTION_VERSION,
-            "content-type": "application/json"
-          },
-          ...body === undefined ? {} : { body: JSON.stringify(body) }
-        });
-      } catch (err) {
-        if (err instanceof TransportError && err.kind === "timeout") {
-          throw new NotionError("timeout", "Notion took too long to answer.");
-        }
-        throw new NotionError("network", "Couldn't reach Notion. Check the phone's connection.");
-      }
-      if (response.status >= 200 && response.status < 300) {
-        try {
-          return JSON.parse(response.body);
-        } catch {
-          throw new NotionError("server", "Notion sent a reply that isn't JSON.");
-        }
-      }
-      throw notionErrorFor(response.status, response.body);
-    }
-  }
-  function notionErrorFor(status, raw) {
-    let message = "";
-    try {
-      message = JSON.parse(raw).message ?? "";
-    } catch {}
-    switch (status) {
-      case 401:
-        return new NotionError("auth", "Notion rejected the integration token. Paste it again from Notion's integration settings.");
-      case 403:
-        return new NotionError("forbidden", "The integration isn't allowed to add pages there. In its Notion settings, turn on “Insert content”.");
-      case 404:
-        return new NotionError("not_found", "Notion can't see that page. Open it in Notion, tap ••• → Connections, and add your integration.");
-      case 429:
-        return new NotionError("rate_limit", "Notion is rate limiting; try again in a minute.");
-    }
-    if (status >= 500 || status === 409)
-      return new NotionError("server", "Notion had an error; try again.");
-    return new NotionError("bad_request", message ? `Notion: ${message}` : `Notion error ${status}.`);
-  }
-
-  // src/background/core/prompts.ts
-  var RECENT_WINDOW_MS = 10 * 60 * 1000;
-  var BRIEF_WINDOW_MS = 60 * 60 * 1000;
-  var DISPLAY = `Your words appear on Even Realities G1 smart glasses: a small monochrome display that shows five short lines at a time, read at a glance while the wearer is in a conversation. Write plain sentences: no Markdown, headings, emoji, preamble or sign-off.`;
-  var TRANSCRIPT = `The transcript comes from live speech recognition through the glasses' microphones. It has no speaker labels, mixes the wearer with the people around them, and contains recognition errors; read through them to what was meant.`;
-  function about(context) {
-    const trimmed = context.trim();
-    return trimmed ? `
-
-About the wearer, in their words: ${trimmed}` : "";
-  }
-  function transcriptBlock(transcript) {
-    return `<transcript>
-${transcript}
-</transcript>`;
-  }
-  function insightPrompt(transcript, earlier, context) {
-    const system = `You are a discreet advisor to the wearer during a live conversation. Every so often you get the latest transcript and decide whether one insight is worth interrupting them for.
-
-Worth showing: the answer to a question someone just asked, when you can answer it reliably; a correction when someone states a wrong fact or number; a key consideration, risk or trade-off the conversation is missing; a sharp question the wearer could ask next. Think like a chief of staff briefing an executive: high signal and decision-relevant.
-
-Not worth showing: a restatement or summary of what was just said, generic advice, anything already covered by an earlier insight, remarks about the transcript itself. When nothing clears that bar, which is most of the time, reply with exactly NONE.
-
-When something does, reply with the insight alone: at most 25 words, one or two sentences, the point first.
-
-${DISPLAY}
-
-${TRANSCRIPT}${about(context)}`;
-    const shown = earlier.length ? `Insights already shown, don't repeat them:
-${earlier.map((t) => `- ${t}`).join(`
-`)}
-
-` : "";
-    const user = `${shown}The conversation so far, oldest first:
-${transcriptBlock(transcript)}
-
-Focus on the last few lines. Reply with one insight, or NONE.`;
-    return { system, user };
-  }
-  function questionPrompt(question, transcript, context) {
-    const system = `The wearer asked you something during their day, usually out loud by starting a sentence with your name, so speech recognition may have garbled it: answer what they most likely meant. The recent conversation is included when there is one; use it when the question refers to it ("that", "what she just said", "sum this up").
-
-Answer like a sharp advisor leaning over: the direct answer first, then one or two sentences of the most useful depth, such as the key reason, number or implication. At most 50 words. If you aren't sure, say so briefly rather than guess.
-
-${DISPLAY}
-
-${TRANSCRIPT}${about(context)}`;
-    const user = transcript ? `Recent conversation, oldest first:
-${transcriptBlock(transcript)}
-
-Question: ${question}` : `Question: ${question}`;
-    return { system, user };
-  }
-  function briefPrompt(transcript, context) {
-    const system = `Brief the wearer on the conversation so far, as you would an executive glancing at a tiny display: the two or three things that matter most, such as decisions, open questions, numbers and next steps. Start each with "- ". At most 60 words in all. If there is too little to brief on, say so in one sentence.
-
-${DISPLAY}
-
-${TRANSCRIPT}${about(context)}`;
-    return { system, user: `The conversation so far, oldest first:
-${transcriptBlock(transcript)}` };
-  }
-  function parseInsight(reply) {
-    const text = cleanText(reply).replace(/^["“]|["”]$/g, "").trim();
-    if (!text || /^none\b/i.test(text))
-      return null;
-    return text;
   }
 
   // src/background/core/transcript.ts
@@ -5385,6 +5118,432 @@ ${transcriptBlock(transcript)}` };
     return text.split(/\s+/).filter(Boolean).length;
   }
 
+  // src/background/core/export.ts
+  var REPLY_GRACE_MS = 10 * 60 * 1000;
+  var KIND_NAMES = { question: "Answer", insight: "Insight", brief: "Brief" };
+  var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function buildExport(lines, replies, utcOffsetMin) {
+    if (lines.length === 0)
+      return null;
+    const start = lines[0].at;
+    const end = lines[lines.length - 1].at;
+    const minutes = Math.max(1, Math.round((end - start) / 60000));
+    return {
+      start,
+      end,
+      minutes,
+      words: lines.reduce((sum, l) => sum + countWords(l.text), 0),
+      title: `Conversation, ${dateLabel(start, utcOffsetMin)}, ${clock(start, utcOffsetMin)}`,
+      about: `Transcribed by Claude HUD from ${clock(start, utcOffsetMin)} to ${clock(end, utcOffsetMin)} (${minutes} min).`,
+      replies: replies.filter((r) => r.at >= start && r.at <= end + REPLY_GRACE_MS).sort((a, b) => a.at - b.at),
+      lines,
+      utcOffsetMin
+    };
+  }
+  function replyLine(r, utcOffsetMin) {
+    const head = `${KIND_NAMES[r.kind]}, ${clock(r.at, utcOffsetMin)}`;
+    return r.question ? `${head}. Q: ${r.question} A: ${r.text}` : `${head}: ${r.text}`;
+  }
+  function transcriptText(doc) {
+    return doc.lines.map((l) => `${clock(l.at, doc.utcOffsetMin)} ${l.text}`).join(`
+`);
+  }
+  function exportText(doc) {
+    const parts = [doc.title, doc.about, ""];
+    if (doc.replies.length) {
+      parts.push("Claude", ...doc.replies.map((r) => `- ${replyLine(r, doc.utcOffsetMin)}`), "");
+    }
+    parts.push("Transcript", transcriptText(doc));
+    return parts.join(`
+`);
+  }
+  function clock(ms, utcOffsetMin) {
+    const d = new Date(ms - utcOffsetMin * 60000);
+    return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  }
+  function dateLabel(ms, utcOffsetMin) {
+    const d = new Date(ms - utcOffsetMin * 60000);
+    return `${DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+  }
+  function pad(n) {
+    return n < 10 ? `0${n}` : String(n);
+  }
+
+  // src/background/core/notion.ts
+  var NOTION_API = "https://api.notion.com/v1";
+  var NOTION_VERSION = "2025-09-03";
+  var BLOCKS_PER_REQUEST = 100;
+  var RICH_TEXT_CHARS = 2000;
+  var RETRIES = 2;
+  var PROPERTIES = {
+    date: { name: "Date", type: "date" },
+    summary: { name: "Summary", type: "rich_text" },
+    tags: { name: "Tags", type: "multi_select" },
+    actionItems: { name: "Action items", type: "rich_text" },
+    minutes: { name: "Duration (min)", type: "number" },
+    words: { name: "Words", type: "number" },
+    replies: { name: "Claude replies", type: "number" }
+  };
+  function parsePageId(link) {
+    const trimmed = link.trim();
+    const peek = /[?&]p=([0-9a-f]{32})\b/i.exec(trimmed);
+    let hex = peek?.[1];
+    if (!hex) {
+      const path = trimmed.split(/[?#]/)[0].replace(/-/g, "");
+      const all = path.match(/[0-9a-f]{32}(?![0-9a-f])/gi);
+      hex = all?.[all.length - 1];
+    }
+    if (!hex)
+      return null;
+    const h = hex.toLowerCase();
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  }
+  function notionPage(doc, notes, schema) {
+    const blocks = [];
+    if (notes) {
+      blocks.push(block("heading_2", text("Summary")));
+      if (notes.summary)
+        blocks.push(block("paragraph", text(notes.summary)));
+      section(blocks, "Key points", notes.keyPoints, "bulleted_list_item");
+      section(blocks, "Decisions", notes.decisions, "bulleted_list_item");
+      section(blocks, "Action items", notes.actionItems, "to_do");
+      section(blocks, "Open questions", notes.openQuestions, "bulleted_list_item");
+    }
+    section(blocks, "Claude on the glasses", doc.replies.map((r) => replyLine(r, doc.utcOffsetMin)), "bulleted_list_item");
+    blocks.push(block("paragraph", text(doc.about, { color: "gray" })));
+    const transcript = doc.lines.map((line) => block("paragraph", [...text(`${clock(line.at, doc.utcOffsetMin)}  `, { color: "gray" }), ...text(line.text)]));
+    return {
+      properties: schema ? databaseProperties(doc, notes, schema) : pageProperties(doc, notes),
+      blocks,
+      transcriptHeading: `Transcript (${doc.lines.length} lines, ${doc.minutes} min)`,
+      transcript
+    };
+  }
+  function section(blocks, heading, items, type) {
+    if (!items.length)
+      return;
+    blocks.push(block("heading_3", text(heading)));
+    for (const item of items)
+      blocks.push(block(type, text(item), type === "to_do" ? { checked: false } : {}));
+  }
+  function pageProperties(doc, notes) {
+    const title = notes ? `${notes.title}, ${dateLabel(doc.start, doc.utcOffsetMin)}` : doc.title;
+    return { title: { title: text(title) } };
+  }
+  function databaseProperties(doc, notes, schema) {
+    const titleName = Object.keys(schema.types).find((name) => schema.types[name] === "title") ?? "Name";
+    const props = { [titleName]: { title: text(notes?.title || doc.title) } };
+    const set = (p, value) => {
+      if (schema.types[p.name] === p.type)
+        props[p.name] = value;
+    };
+    set(PROPERTIES.date, {
+      date: { start: new Date(doc.start).toISOString(), end: doc.end > doc.start ? new Date(doc.end).toISOString() : null }
+    });
+    set(PROPERTIES.minutes, { number: doc.minutes });
+    set(PROPERTIES.words, { number: doc.words });
+    set(PROPERTIES.replies, { number: doc.replies.length });
+    if (notes) {
+      if (notes.summary)
+        set(PROPERTIES.summary, { rich_text: text(notes.summary) });
+      if (notes.tags.length)
+        set(PROPERTIES.tags, { multi_select: notes.tags.map((name) => ({ name })) });
+      if (notes.actionItems.length) {
+        set(PROPERTIES.actionItems, { rich_text: text(notes.actionItems.map((a) => `• ${a}`).join(`
+`)) });
+      }
+    }
+    return props;
+  }
+  function block(type, richText, extra = {}) {
+    return { object: "block", type, [type]: { rich_text: richText, ...extra } };
+  }
+  function text(content, annotations) {
+    const pieces = [];
+    for (let i = 0;i < content.length || i === 0; i += RICH_TEXT_CHARS) {
+      pieces.push({
+        type: "text",
+        text: { content: content.slice(i, i + RICH_TEXT_CHARS) },
+        ...annotations ? { annotations } : {}
+      });
+    }
+    return pieces;
+  }
+  function plainText(rich) {
+    return (rich ?? []).map((t) => t.plain_text ?? "").join("").trim();
+  }
+
+  class NotionError extends Error {
+    kind;
+    url;
+    constructor(kind, message, url) {
+      super(message);
+      this.kind = kind;
+      this.url = url;
+      this.name = "NotionError";
+    }
+    get retryable() {
+      return this.kind === "rate_limit" || this.kind === "server" || this.kind === "network" || this.kind === "timeout";
+    }
+  }
+
+  class NotionClient {
+    deps;
+    constructor(deps) {
+      this.deps = deps;
+    }
+    async findTarget(token, id) {
+      try {
+        const db = await this.call(token, "GET", `/databases/${id}`);
+        const source = db.data_sources?.[0];
+        if (source)
+          return { kind: "database", id: source.id, title: plainText(db.title) || source.name || "Untitled" };
+      } catch (err) {
+        if (!(err instanceof NotionError) || err.kind !== "not_found" && err.kind !== "bad_request")
+          throw err;
+      }
+      return { kind: "page", id, title: await this.pageTitle(token, id) };
+    }
+    async pageTitle(token, pageId) {
+      const page = await this.call(token, "GET", `/pages/${pageId}`);
+      const titleProp = Object.values(page.properties ?? {}).find((p) => p.type === "title");
+      return plainText(titleProp?.title) || "Untitled";
+    }
+    async schema(token, dataSourceId) {
+      const source = await this.call(token, "GET", `/data_sources/${dataSourceId}`);
+      const types = {};
+      const options = {};
+      for (const [name, prop] of Object.entries(source.properties ?? {})) {
+        types[name] = prop.type ?? "";
+        if (prop.multi_select)
+          options[name] = (prop.multi_select.options ?? []).map((o) => o.name ?? "").filter(Boolean);
+      }
+      return { types, options };
+    }
+    async createPage(token, target, page, onProgress) {
+      const parent = target.kind === "database" ? { type: "data_source_id", data_source_id: target.id } : { page_id: target.id };
+      const created = await this.call(token, "POST", "/pages", {
+        parent,
+        properties: page.properties,
+        children: page.blocks.slice(0, BLOCKS_PER_REQUEST)
+      });
+      const id = created.id ?? "";
+      const url = created.url ?? `https://www.notion.so/${id.replace(/-/g, "")}`;
+      const total = page.transcript.length;
+      try {
+        await this.append(token, id, page.blocks.slice(BLOCKS_PER_REQUEST));
+        const heading = {
+          object: "block",
+          type: "heading_2",
+          heading_2: { rich_text: text(page.transcriptHeading), is_toggleable: true }
+        };
+        const added = await this.call(token, "PATCH", `/blocks/${id}/children`, { children: [heading] });
+        const toggleId = added.results?.[0]?.id;
+        if (!toggleId)
+          throw new NotionError("server", "Notion didn't return the transcript heading.");
+        await this.append(token, toggleId, page.transcript, (saved) => onProgress?.(saved, total));
+      } catch (err) {
+        const reason = err instanceof NotionError ? err.message : "Notion stopped answering.";
+        throw new NotionError("server", `The page was created, but the transcript is incomplete. ${reason}`, url);
+      }
+      return url;
+    }
+    async append(token, blockId, blocks, onBatch) {
+      for (let i = 0;i < blocks.length; i += BLOCKS_PER_REQUEST) {
+        const batch = blocks.slice(i, i + BLOCKS_PER_REQUEST);
+        await this.call(token, "PATCH", `/blocks/${blockId}/children`, { children: batch });
+        onBatch?.(i + batch.length);
+      }
+    }
+    async call(token, method, path, body) {
+      for (let attempt = 0;; attempt++) {
+        try {
+          return await this.once(token, method, path, body);
+        } catch (err) {
+          if (!(err instanceof NotionError) || !err.retryable || attempt >= RETRIES)
+            throw err;
+          await sleep(this.deps.scheduler, 1000 * (attempt + 1));
+        }
+      }
+    }
+    async once(token, method, path, body) {
+      let response;
+      try {
+        response = await send(this.deps, `${NOTION_API}${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            "notion-version": NOTION_VERSION,
+            "content-type": "application/json"
+          },
+          ...body === undefined ? {} : { body: JSON.stringify(body) }
+        });
+      } catch (err) {
+        if (err instanceof TransportError && err.kind === "timeout") {
+          throw new NotionError("timeout", "Notion took too long to answer.");
+        }
+        throw new NotionError("network", "Couldn't reach Notion. Check the phone's connection.");
+      }
+      if (response.status >= 200 && response.status < 300) {
+        try {
+          return JSON.parse(response.body);
+        } catch {
+          throw new NotionError("server", "Notion sent a reply that isn't JSON.");
+        }
+      }
+      throw notionErrorFor(response.status, response.body);
+    }
+  }
+  function notionErrorFor(status, raw) {
+    let message = "";
+    try {
+      message = JSON.parse(raw).message ?? "";
+    } catch {}
+    switch (status) {
+      case 401:
+        return new NotionError("auth", "Notion rejected the integration token. Paste it again from Notion's integration settings.");
+      case 403:
+        return new NotionError("forbidden", "The integration isn't allowed to add pages there. In its Notion settings, turn on “Insert content”.");
+      case 404:
+        return new NotionError("not_found", "Notion can't see that page or database. Open it in Notion, tap ••• → Connections, and add your integration.");
+      case 429:
+        return new NotionError("rate_limit", "Notion is rate limiting; try again in a minute.");
+    }
+    if (status >= 500 || status === 409)
+      return new NotionError("server", "Notion had an error; try again.");
+    return new NotionError("bad_request", message ? `Notion: ${message}` : `Notion error ${status}.`);
+  }
+
+  // src/background/core/prompts.ts
+  var RECENT_WINDOW_MS = 10 * 60 * 1000;
+  var BRIEF_WINDOW_MS = 60 * 60 * 1000;
+  var DISPLAY = `Your words appear on Even Realities G1 smart glasses: a small monochrome display that shows five short lines at a time, read at a glance while the wearer is in a conversation. Write plain sentences: no Markdown, headings, emoji, preamble or sign-off.`;
+  var TRANSCRIPT = `The transcript comes from live speech recognition through the glasses' microphones. It has no speaker labels, mixes the wearer with the people around them, and contains recognition errors; read through them to what was meant.`;
+  function about(context) {
+    const trimmed = context.trim();
+    return trimmed ? `
+
+About the wearer, in their words: ${trimmed}` : "";
+  }
+  function transcriptBlock(transcript) {
+    return `<transcript>
+${transcript}
+</transcript>`;
+  }
+  function insightPrompt(transcript, earlier, context) {
+    const system = `You are a discreet advisor to the wearer during a live conversation. Every so often you get the latest transcript and decide whether one insight is worth interrupting them for.
+
+Worth showing: the answer to a question someone just asked, when you can answer it reliably; a correction when someone states a wrong fact or number; a key consideration, risk or trade-off the conversation is missing; a sharp question the wearer could ask next. Think like a chief of staff briefing an executive: high signal and decision-relevant.
+
+Not worth showing: a restatement or summary of what was just said, generic advice, anything already covered by an earlier insight, remarks about the transcript itself. When nothing clears that bar, which is most of the time, reply with exactly NONE.
+
+When something does, reply with the insight alone: at most 25 words, one or two sentences, the point first.
+
+${DISPLAY}
+
+${TRANSCRIPT}${about(context)}`;
+    const shown = earlier.length ? `Insights already shown, don't repeat them:
+${earlier.map((t) => `- ${t}`).join(`
+`)}
+
+` : "";
+    const user = `${shown}The conversation so far, oldest first:
+${transcriptBlock(transcript)}
+
+Focus on the last few lines. Reply with one insight, or NONE.`;
+    return { system, user };
+  }
+  function questionPrompt(question, transcript, context) {
+    const system = `The wearer asked you something during their day, usually out loud by starting a sentence with your name, so speech recognition may have garbled it: answer what they most likely meant. The recent conversation is included when there is one; use it when the question refers to it ("that", "what she just said", "sum this up").
+
+Answer like a sharp advisor leaning over: the direct answer first, then one or two sentences of the most useful depth, such as the key reason, number or implication. At most 50 words. If you aren't sure, say so briefly rather than guess.
+
+${DISPLAY}
+
+${TRANSCRIPT}${about(context)}`;
+    const user = transcript ? `Recent conversation, oldest first:
+${transcriptBlock(transcript)}
+
+Question: ${question}` : `Question: ${question}`;
+    return { system, user };
+  }
+  function briefPrompt(transcript, context) {
+    const system = `Brief the wearer on the conversation so far, as you would an executive glancing at a tiny display: the two or three things that matter most, such as decisions, open questions, numbers and next steps. Start each with "- ". At most 60 words in all. If there is too little to brief on, say so in one sentence.
+
+${DISPLAY}
+
+${TRANSCRIPT}${about(context)}`;
+    return { system, user: `The conversation so far, oldest first:
+${transcriptBlock(transcript)}` };
+  }
+  function parseInsight(reply) {
+    const text = cleanText(reply).replace(/^["“]|["”]$/g, "").trim();
+    if (!text || /^none\b/i.test(text))
+      return null;
+    return text;
+  }
+  var stringList = { type: "array", items: { type: "string" } };
+  var NOTES_SCHEMA = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      summary: { type: "string" },
+      tags: stringList,
+      key_points: stringList,
+      decisions: stringList,
+      action_items: stringList,
+      open_questions: stringList
+    },
+    required: ["title", "summary", "tags", "key_points", "decisions", "action_items", "open_questions"],
+    additionalProperties: false
+  };
+  function notesPrompt(transcript, replies, tags, context) {
+    const tagRule = tags.length ? `one to three, taken from the existing tags when one fits (${tags.join(", ")}); add a new tag only when none fits, in one or two words styled like the others` : "one to three, one or two words each";
+    const system = `You turn a conversation heard through the wearer's smart glasses into notes for their Notion, where they come back to it later. Write for the wearer, an expert who wants the substance fast.
+
+- title: the main topic in 3 to 8 words. No date, and no "Conversation about".
+- summary: one or two sentences on what it was about and where it ended up.
+- tags: ${tagRule}.
+- key_points: the facts, numbers and arguments worth keeping.
+- decisions: what was agreed.
+- action_items: who does what, starting with a verb; name the person when the transcript says who.
+- open_questions: what was left unanswered.
+
+Short sentences, plain text. Leave a list empty when there is nothing for it, and keep to what the transcript supports.
+
+${TRANSCRIPT}${about(context)}`;
+    const shown = replies.length ? `What you showed on the glasses during it:
+${replies.map((r) => `- ${r}`).join(`
+`)}
+
+` : "";
+    return { system, user: `${shown}The conversation, oldest first:
+${transcriptBlock(transcript)}` };
+  }
+  function parseNotes(reply) {
+    let raw;
+    try {
+      raw = JSON.parse(reply);
+    } catch {
+      return null;
+    }
+    const text = (v) => typeof v === "string" ? cleanText(v) : "";
+    const list = (v) => Array.isArray(v) ? v.map(text).filter(Boolean) : [];
+    const title = text(raw.title);
+    if (!title)
+      return null;
+    return {
+      title,
+      summary: text(raw.summary),
+      tags: list(raw.tags).map((t) => t.replace(/\s*,\s*/g, " ").trim()).filter(Boolean).slice(0, 3),
+      keyPoints: list(raw.key_points),
+      decisions: list(raw.decisions),
+      actionItems: list(raw.action_items),
+      openQuestions: list(raw.open_questions)
+    };
+  }
+
   // src/background/core/wake.ts
   var NAME = String.raw`(?:claude|claud|clawed|clod)`;
   var GREETING = String.raw`(?:hey|hi|ok|okay)[,!.]?\s+`;
@@ -5416,6 +5575,7 @@ ${transcriptBlock(transcript)}` };
     model: "claude-sonnet-5-5",
     questionEffort: "low",
     context: "",
+    summarizeExports: true,
     ...DEFAULT_PAGING
   };
   var STORAGE_KEYS = { settings: "settings", apiKey: "apiKey", replies: "replies", usage: "usage", notion: "notion" };
@@ -5430,6 +5590,7 @@ ${transcriptBlock(transcript)}` };
   var MAX_BACKOFF_MS = 5 * 60 * 1000;
   var EARLIER_INSIGHTS = 6;
   var UI_INTERIM_THROTTLE_MS = 400;
+  var NOTES_TIMEOUT_MS = 120000;
   var STATUS_LISTENING = "Claude is listening…";
   var STATUS_THINKING = "Claude is thinking…";
   var TEST_TEXT = "Claude HUD is connected. Say “Claude,” then your question, and the answer shows up here. " + "Insights from the conversation appear on their own.";
@@ -5714,18 +5875,50 @@ ${transcriptBlock(transcript)}` };
       const doc = this.exportDoc(utcOffsetMin);
       if (!doc)
         return;
-      const blocks = notionBlocks(doc);
+      const { token, target } = notion;
       this.setExportStatus({ busy: true, ok: true, message: "Saving to Notion…" });
       try {
-        const url = await this.notionClient.createPage(notion.token, notion.pageId, doc.title, blocks, (saved, total) => {
+        const schema = target.kind === "database" ? await this.notionClient.schema(token, target.id) : null;
+        const { notes, issue } = await this.writeNotes(doc, schema?.options[PROPERTIES.tags.name] ?? []);
+        this.setExportStatus({ busy: true, ok: true, message: "Saving to Notion…" });
+        const url = await this.notionClient.createPage(token, target, notionPage(doc, notes, schema), (saved, total) => {
           if (total > BLOCKS_PER_REQUEST && saved < total) {
             this.setExportStatus({ busy: true, ok: true, message: `Saving to Notion… ${Math.round(saved / total * 100)}%` });
           }
         });
-        this.setExportStatus({ busy: false, ok: true, message: `Saved to Notion under “${notion.pageTitle}”.`, url });
+        const where = target.kind === "database" ? `the “${target.title}” database` : `“${target.title}”`;
+        const saved = `Saved “${notes?.title ?? doc.title}” to ${where}.`;
+        this.setExportStatus({ busy: false, ok: true, message: issue ? `${saved} Without Claude's notes: ${issue}` : saved, url });
       } catch (err) {
         const url = err instanceof NotionError ? err.url : undefined;
         this.setExportStatus({ busy: false, ok: false, message: notionErrorText(err), ...url ? { url } : {} });
+      }
+    }
+    async writeNotes(doc, tags) {
+      if (!this.settings.summarizeExports)
+        return { notes: null, issue: null };
+      const apiKey = this.apiKey;
+      if (!apiKey)
+        return { notes: null, issue: "no Claude API key is saved." };
+      this.setExportStatus({ busy: true, ok: true, message: "Claude is writing the notes…" });
+      const replies = doc.replies.map((r) => replyLine(r, doc.utcOffsetMin));
+      const prompt = notesPrompt(transcriptText(doc), replies, tags, this.settings.context);
+      try {
+        const reply = await this.client.ask(apiKey, {
+          ...prompt,
+          model: this.settings.model,
+          effort: this.settings.questionEffort,
+          maxTokens: 16000,
+          jsonSchema: NOTES_SCHEMA,
+          timeoutMs: NOTES_TIMEOUT_MS
+        }, 1);
+        this.countUsage(reply.inputTokens, reply.outputTokens);
+        const notes = parseNotes(reply.text);
+        return notes ? { notes, issue: null } : { notes: null, issue: "Claude's notes came back in an unexpected shape." };
+      } catch (err) {
+        if (err instanceof ClaudeError && err.kind === "auth")
+          this.keyRejected = true;
+        return { notes: null, issue: errorText(err) };
       }
     }
     async connectNotion(token, pageLink) {
@@ -5736,18 +5929,19 @@ ${transcriptBlock(transcript)}` };
       if (!pageId) {
         return this.setNotionCheck({
           ok: false,
-          message: "That isn't a Notion page link. In Notion, open the page and use Share → Copy link."
+          message: "That isn't a Notion link. In Notion, open the database or page and use Share → Copy link."
         });
       }
       await this.verifyNotion(clean, pageId);
     }
-    async verifyNotion(token, pageId) {
+    async verifyNotion(token, linkId) {
       this.setNotionCheck({ ok: true, message: "Checking…" });
       try {
-        const pageTitle = await this.notionClient.pageTitle(token, pageId);
-        this.notion = { token, pageId, pageTitle };
+        const target = await this.notionClient.findTarget(token, linkId);
+        this.notion = { token, linkId, target };
         this.save(STORAGE_KEYS.notion, this.notion);
-        this.setNotionCheck({ ok: true, message: `Connected. Exports go under “${pageTitle}”.` });
+        const where = target.kind === "database" ? `Each conversation becomes a row of the “${target.title}” database.` : `Exports go under “${target.title}”.`;
+        this.setNotionCheck({ ok: true, message: `Connected. ${where}` });
       } catch (err) {
         this.setNotionCheck({ ok: false, message: notionErrorText(err) });
       }
@@ -5777,7 +5971,8 @@ ${transcriptBlock(transcript)}` };
         interim: this.transcript.interim,
         heardLines: this.transcript.length,
         notion: {
-          pageTitle: this.notion?.pageTitle ?? null,
+          title: this.notion?.target.title ?? null,
+          kind: this.notion?.target.kind ?? null,
           tokenHint: this.notion ? `…${this.notion.token.slice(-4)}` : null,
           check: this.notionCheck
         },
@@ -5841,7 +6036,7 @@ ${transcriptBlock(transcript)}` };
         this.broadcast();
       }), ui.on("export:share", ({ utcOffsetMin }) => void this.shareTranscript(utcOffsetMin)), ui.on("export:notion", ({ utcOffsetMin }) => void this.saveToNotion(utcOffsetMin)), ui.on("notion:connect", ({ token, pageLink }) => void this.connectNotion(token, pageLink)), ui.on("notion:check", () => {
         if (this.notion)
-          this.verifyNotion(this.notion.token, this.notion.pageId);
+          this.verifyNotion(this.notion.token, this.notion.linkId);
       }), ui.on("notion:disconnect", () => {
         this.notion = null;
         this.notionCheck = null;
@@ -5918,8 +6113,7 @@ ${transcriptBlock(transcript)}` };
         this.replies = replies.filter(isReply).slice(0, REPLY_LIMIT);
       if (isUsage(usage))
         this.usage = usage;
-      if (isNotionTarget(notion))
-        this.notion = notion;
+      this.notion = notionConnection(notion);
     }
     save(key, value) {
       this.session.storage.set(key, JSON.stringify(value)).catch((err) => {
@@ -5936,6 +6130,7 @@ ${transcriptBlock(transcript)}` };
       model: MODELS.includes(s.model) ? s.model : DEFAULT_SETTINGS.model,
       questionEffort: EFFORTS.includes(s.questionEffort) ? s.questionEffort : DEFAULT_SETTINGS.questionEffort,
       context: typeof s.context === "string" ? s.context.slice(0, CONTEXT_CHARS) : "",
+      summarizeExports: s.summarizeExports !== false,
       ...sanitizePaging(s)
     };
   }
@@ -5955,9 +6150,19 @@ ${transcriptBlock(transcript)}` };
     const r = x;
     return !!r && typeof r.id === "string" && typeof r.text === "string" && typeof r.at === "number";
   }
-  function isNotionTarget(x) {
+  function notionConnection(x) {
     const n = x;
-    return !!n && typeof n.token === "string" && typeof n.pageId === "string" && typeof n.pageTitle === "string";
+    if (!n || typeof n.token !== "string")
+      return null;
+    const t = n.target;
+    if (typeof n.linkId === "string" && t && (t.kind === "database" || t.kind === "page")) {
+      if (typeof t.id === "string" && typeof t.title === "string")
+        return { token: n.token, linkId: n.linkId, target: t };
+    }
+    if (typeof n.pageId === "string" && typeof n.pageTitle === "string") {
+      return { token: n.token, linkId: n.pageId, target: { kind: "page", id: n.pageId, title: n.pageTitle } };
+    }
+    return null;
   }
   function isUsage(x) {
     const u = x;
