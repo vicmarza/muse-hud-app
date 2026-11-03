@@ -4864,11 +4864,40 @@
   var MODELS = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"];
   var EFFORTS = ["low", "medium", "high"];
 
+  // src/background/core/http.ts
+  class TransportError extends Error {
+    kind;
+    constructor(kind) {
+      super(kind === "timeout" ? "timed out" : "network error");
+      this.kind = kind;
+      this.name = "TransportError";
+    }
+  }
+  var DEFAULT_TIMEOUT_MS = 45000;
+  async function send(deps, url, init) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = deps.scheduler.set(() => reject(new TransportError("timeout")), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    });
+    try {
+      const response = await Promise.race([deps.fetch(url, init), timeout]);
+      return { status: response.status, body: await response.text() };
+    } catch (err) {
+      if (err instanceof TransportError)
+        throw err;
+      throw new TransportError("network");
+    } finally {
+      deps.scheduler.clear(timer);
+    }
+  }
+  function sleep(scheduler, ms) {
+    return new Promise((resolve) => scheduler.set(resolve, ms));
+  }
+
   // src/background/core/claude.ts
   var API_BASE = "https://api.anthropic.com/v1";
   var API_VERSION = "2026-10-21";
   var FALLBACK_BETA = "server-side-fallback-2026-07-01";
-  var DEFAULT_TIMEOUT_MS = 45000;
   var RETRY_DELAY_MS = 1500;
   var MODEL_NAMES = {
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
@@ -4912,7 +4941,7 @@
         } catch (err) {
           if (!(err instanceof ClaudeError) || !err.retryable || attempt >= retries)
             throw err;
-          await this.sleep(RETRY_DELAY_MS);
+          await sleep(this.deps.scheduler, RETRY_DELAY_MS);
         }
       }
     }
@@ -4958,24 +4987,14 @@
       };
     }
     async request(url, init) {
-      const timeoutMs = this.deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-      let timer = null;
-      const timeout = new Promise((_, reject) => {
-        timer = this.deps.scheduler.set(() => reject(new ClaudeError("timeout", "Claude took too long to answer.")), timeoutMs);
-      });
       try {
-        const response = await Promise.race([this.deps.fetch(url, init), timeout]);
-        return { status: response.status, body: await response.text() };
+        return await send(this.deps, url, init);
       } catch (err) {
-        if (err instanceof ClaudeError)
-          throw err;
+        if (err instanceof TransportError && err.kind === "timeout") {
+          throw new ClaudeError("timeout", "Claude took too long to answer.");
+        }
         throw new ClaudeError("network", "Couldn't reach the Claude API. Check the phone's connection.");
-      } finally {
-        this.deps.scheduler.clear(timer);
       }
-    }
-    sleep(ms) {
-      return new Promise((resolve) => this.deps.scheduler.set(resolve, ms));
     }
   }
   function parseReply(raw) {
@@ -5025,8 +5044,206 @@
     return new ClaudeError("bad_request", message ? `Claude API: ${message}` : `Claude API error ${status}.`, status);
   }
 
+  // src/background/core/export.ts
+  var REPLY_GRACE_MS = 10 * 60 * 1000;
+  var KIND_NAMES = { question: "Answer", insight: "Insight", brief: "Brief" };
+  var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function buildExport(lines, replies, utcOffsetMin) {
+    if (lines.length === 0)
+      return null;
+    const start = lines[0].at;
+    const end = lines[lines.length - 1].at;
+    const minutes = Math.max(1, Math.round((end - start) / 60000));
+    return {
+      title: `Conversation, ${dateLabel(start, utcOffsetMin)}, ${clock(start, utcOffsetMin)}`,
+      about: `Transcribed by Claude HUD from ${clock(start, utcOffsetMin)} to ${clock(end, utcOffsetMin)} (${minutes} min).`,
+      replies: replies.filter((r) => r.at >= start && r.at <= end + REPLY_GRACE_MS).sort((a, b) => a.at - b.at),
+      lines,
+      utcOffsetMin
+    };
+  }
+  function replyLine(r, utcOffsetMin) {
+    const head = `${KIND_NAMES[r.kind]}, ${clock(r.at, utcOffsetMin)}`;
+    return r.question ? `${head}. Q: ${r.question} A: ${r.text}` : `${head}: ${r.text}`;
+  }
+  function exportText(doc) {
+    const parts = [doc.title, doc.about, ""];
+    if (doc.replies.length) {
+      parts.push("Claude", ...doc.replies.map((r) => `- ${replyLine(r, doc.utcOffsetMin)}`), "");
+    }
+    parts.push("Transcript", ...doc.lines.map((l) => `${clock(l.at, doc.utcOffsetMin)} ${l.text}`));
+    return parts.join(`
+`);
+  }
+  function clock(ms, utcOffsetMin) {
+    const d = new Date(ms - utcOffsetMin * 60000);
+    return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  }
+  function dateLabel(ms, utcOffsetMin) {
+    const d = new Date(ms - utcOffsetMin * 60000);
+    return `${DAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+  }
+  function pad(n) {
+    return n < 10 ? `0${n}` : String(n);
+  }
+
+  // src/background/core/notion.ts
+  var NOTION_API = "https://api.notion.com/v1";
+  var NOTION_VERSION = "2025-09-03";
+  var BLOCKS_PER_REQUEST = 100;
+  var RICH_TEXT_CHARS = 2000;
+  var RETRIES = 2;
+  function parsePageId(link) {
+    const trimmed = link.trim();
+    const peek = /[?&]p=([0-9a-f]{32})\b/i.exec(trimmed);
+    let hex = peek?.[1];
+    if (!hex) {
+      const path = trimmed.split(/[?#]/)[0].replace(/-/g, "");
+      const all = path.match(/[0-9a-f]{32}(?![0-9a-f])/gi);
+      hex = all?.[all.length - 1];
+    }
+    if (!hex)
+      return null;
+    const h = hex.toLowerCase();
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  }
+  function notionBlocks(doc) {
+    const blocks = [block("paragraph", text(doc.about, { color: "gray" }))];
+    if (doc.replies.length) {
+      blocks.push(block("heading_2", text("Claude")));
+      for (const r of doc.replies)
+        blocks.push(block("bulleted_list_item", text(replyLine(r, doc.utcOffsetMin))));
+    }
+    blocks.push(block("heading_2", text("Transcript")));
+    for (const line of doc.lines) {
+      blocks.push(block("paragraph", [...text(`${clock(line.at, doc.utcOffsetMin)}  `, { color: "gray" }), ...text(line.text)]));
+    }
+    return blocks;
+  }
+  function block(type, richText) {
+    return { object: "block", type, [type]: { rich_text: richText } };
+  }
+  function text(content, annotations) {
+    const pieces = [];
+    for (let i = 0;i < content.length || i === 0; i += RICH_TEXT_CHARS) {
+      pieces.push({
+        type: "text",
+        text: { content: content.slice(i, i + RICH_TEXT_CHARS) },
+        ...annotations ? { annotations } : {}
+      });
+    }
+    return pieces;
+  }
+
+  class NotionError extends Error {
+    kind;
+    url;
+    constructor(kind, message, url) {
+      super(message);
+      this.kind = kind;
+      this.url = url;
+      this.name = "NotionError";
+    }
+    get retryable() {
+      return this.kind === "rate_limit" || this.kind === "server" || this.kind === "network" || this.kind === "timeout";
+    }
+  }
+
+  class NotionClient {
+    deps;
+    constructor(deps) {
+      this.deps = deps;
+    }
+    async pageTitle(token, pageId) {
+      const page = await this.call(token, "GET", `/pages/${pageId}`);
+      const titleProp = Object.values(page.properties ?? {}).find((p) => p.type === "title");
+      return (titleProp?.title ?? []).map((t) => t.plain_text ?? "").join("").trim() || "Untitled";
+    }
+    async createPage(token, parentId, title, blocks, onProgress) {
+      const first = blocks.slice(0, BLOCKS_PER_REQUEST);
+      const page = await this.call(token, "POST", "/pages", {
+        parent: { page_id: parentId },
+        properties: { title: { title: [{ type: "text", text: { content: title } }] } },
+        children: first
+      });
+      const id = page.id ?? "";
+      const url = page.url ?? `https://www.notion.so/${id.replace(/-/g, "")}`;
+      onProgress?.(first.length, blocks.length);
+      for (let i = BLOCKS_PER_REQUEST;i < blocks.length; i += BLOCKS_PER_REQUEST) {
+        const batch = blocks.slice(i, i + BLOCKS_PER_REQUEST);
+        try {
+          await this.call(token, "PATCH", `/blocks/${id}/children`, { children: batch });
+        } catch (err) {
+          const reason = err instanceof NotionError ? err.message : "Notion stopped answering.";
+          throw new NotionError("server", `Saved part of it (${i} of ${blocks.length} blocks). ${reason}`, url);
+        }
+        onProgress?.(i + batch.length, blocks.length);
+      }
+      return url;
+    }
+    async call(token, method, path, body) {
+      for (let attempt = 0;; attempt++) {
+        try {
+          return await this.once(token, method, path, body);
+        } catch (err) {
+          if (!(err instanceof NotionError) || !err.retryable || attempt >= RETRIES)
+            throw err;
+          await sleep(this.deps.scheduler, 1000 * (attempt + 1));
+        }
+      }
+    }
+    async once(token, method, path, body) {
+      let response;
+      try {
+        response = await send(this.deps, `${NOTION_API}${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            "notion-version": NOTION_VERSION,
+            "content-type": "application/json"
+          },
+          ...body === undefined ? {} : { body: JSON.stringify(body) }
+        });
+      } catch (err) {
+        if (err instanceof TransportError && err.kind === "timeout") {
+          throw new NotionError("timeout", "Notion took too long to answer.");
+        }
+        throw new NotionError("network", "Couldn't reach Notion. Check the phone's connection.");
+      }
+      if (response.status >= 200 && response.status < 300) {
+        try {
+          return JSON.parse(response.body);
+        } catch {
+          throw new NotionError("server", "Notion sent a reply that isn't JSON.");
+        }
+      }
+      throw notionErrorFor(response.status, response.body);
+    }
+  }
+  function notionErrorFor(status, raw) {
+    let message = "";
+    try {
+      message = JSON.parse(raw).message ?? "";
+    } catch {}
+    switch (status) {
+      case 401:
+        return new NotionError("auth", "Notion rejected the integration token. Paste it again from Notion's integration settings.");
+      case 403:
+        return new NotionError("forbidden", "The integration isn't allowed to add pages there. In its Notion settings, turn on “Insert content”.");
+      case 404:
+        return new NotionError("not_found", "Notion can't see that page. Open it in Notion, tap ••• → Connections, and add your integration.");
+      case 429:
+        return new NotionError("rate_limit", "Notion is rate limiting; try again in a minute.");
+    }
+    if (status >= 500 || status === 409)
+      return new NotionError("server", "Notion had an error; try again.");
+    return new NotionError("bad_request", message ? `Notion: ${message}` : `Notion error ${status}.`);
+  }
+
   // src/background/core/prompts.ts
   var RECENT_WINDOW_MS = 10 * 60 * 1000;
+  var BRIEF_WINDOW_MS = 60 * 60 * 1000;
   var DISPLAY = `Your words appear on Even Realities G1 smart glasses: a small monochrome display that shows five short lines at a time, read at a glance while the wearer is in a conversation. Write plain sentences: no Markdown, headings, emoji, preamble or sign-off.`;
   var TRANSCRIPT = `The transcript comes from live speech recognition through the glasses' microphones. It has no speaker labels, mixes the wearer with the people around them, and contains recognition errors; read through them to what was meant.`;
   function about(context) {
@@ -5094,8 +5311,8 @@ ${transcriptBlock(transcript)}` };
   }
 
   // src/background/core/transcript.ts
-  var KEEP_MS = 60 * 60 * 1000;
-  var KEEP_CHARS = 60000;
+  var KEEP_MS = 3 * 60 * 60 * 1000;
+  var KEEP_CHARS = 200000;
   var PAUSE_MARK_MS = 2 * 60 * 1000;
 
   class Transcript {
@@ -5125,6 +5342,9 @@ ${transcriptBlock(transcript)}` };
     tail(n) {
       return this.lines.slice(-n);
     }
+    all() {
+      return [...this.lines];
+    }
     wordsAfter(at) {
       let words = 0;
       for (let i = this.lines.length - 1;i >= 0 && this.lines[i].at > at; i--) {
@@ -5134,6 +5354,9 @@ ${transcriptBlock(transcript)}` };
     }
     get isEmpty() {
       return this.lines.length === 0;
+    }
+    get length() {
+      return this.lines.length;
     }
     text(windowMs, now) {
       const from = now - windowMs;
@@ -5195,7 +5418,7 @@ ${transcriptBlock(transcript)}` };
     context: "",
     ...DEFAULT_PAGING
   };
-  var STORAGE_KEYS = { settings: "settings", apiKey: "apiKey", replies: "replies", usage: "usage" };
+  var STORAGE_KEYS = { settings: "settings", apiKey: "apiKey", replies: "replies", usage: "usage", notion: "notion" };
   var REPLY_LIMIT = 25;
   var TRANSCRIPT_TAIL = 12;
   var CONTEXT_CHARS = 600;
@@ -5231,6 +5454,10 @@ ${transcriptBlock(transcript)}` };
     transcript = new Transcript;
     pager;
     client;
+    notionClient;
+    notion = null;
+    notionCheck = null;
+    exportStatus = null;
     unsubs = [];
     stopTranscription = null;
     tickTimer = null;
@@ -5249,6 +5476,7 @@ ${transcriptBlock(transcript)}` };
       this.deps = deps;
       this.usage = emptyUsage(deps.now());
       this.client = new ClaudeClient({ fetch: deps.fetch, scheduler: deps.scheduler });
+      this.notionClient = new NotionClient({ fetch: deps.fetch, scheduler: deps.scheduler });
       this.pager = new Pager({
         display: session.display,
         canvas: () => displayCanvas(this.session.capabilities),
@@ -5368,7 +5596,7 @@ ${transcriptBlock(transcript)}` };
         this.broadcast();
         return;
       }
-      const transcript = this.transcript.text(KEEP_MS, this.deps.now());
+      const transcript = this.transcript.text(BRIEF_WINDOW_MS, this.deps.now());
       await this.request("brief", briefPrompt(transcript, this.settings.context));
     }
     async request(kind, prompt, question) {
@@ -5452,6 +5680,86 @@ ${transcriptBlock(transcript)}` };
     coveringAnswer() {
       return this.asking > 0 || this.capture !== null || this.showingKind === "question" || this.showingKind === "brief";
     }
+    exportDoc(utcOffsetMin) {
+      const offset = Number.isFinite(utcOffsetMin) ? clamp(utcOffsetMin, -14 * 60, 14 * 60, 0) : 0;
+      const doc = buildExport(this.transcript.all(), this.replies, offset);
+      if (!doc)
+        this.setExportStatus({ busy: false, ok: false, message: "Nothing heard yet, so there's nothing to export." });
+      return doc;
+    }
+    async shareTranscript(utcOffsetMin) {
+      const doc = this.exportDoc(utcOffsetMin);
+      if (!doc)
+        return;
+      try {
+        const result = await this.session.system.share({ title: doc.title, text: exportText(doc) });
+        if (result.cancelled)
+          this.setExportStatus(null);
+        else if (result.success)
+          this.setExportStatus({ busy: false, ok: true, message: "Shared." });
+        else
+          this.setExportStatus({ busy: false, ok: false, message: "The share sheet didn't open." });
+      } catch {
+        this.setExportStatus({ busy: false, ok: false, message: "The share sheet didn't open." });
+      }
+    }
+    async saveToNotion(utcOffsetMin) {
+      const notion = this.notion;
+      if (!notion) {
+        this.setExportStatus({ busy: false, ok: false, message: "Connect Notion first, under Notion below." });
+        return;
+      }
+      if (this.exportStatus?.busy)
+        return;
+      const doc = this.exportDoc(utcOffsetMin);
+      if (!doc)
+        return;
+      const blocks = notionBlocks(doc);
+      this.setExportStatus({ busy: true, ok: true, message: "Saving to Notion…" });
+      try {
+        const url = await this.notionClient.createPage(notion.token, notion.pageId, doc.title, blocks, (saved, total) => {
+          if (total > BLOCKS_PER_REQUEST && saved < total) {
+            this.setExportStatus({ busy: true, ok: true, message: `Saving to Notion… ${Math.round(saved / total * 100)}%` });
+          }
+        });
+        this.setExportStatus({ busy: false, ok: true, message: `Saved to Notion under “${notion.pageTitle}”.`, url });
+      } catch (err) {
+        const url = err instanceof NotionError ? err.url : undefined;
+        this.setExportStatus({ busy: false, ok: false, message: notionErrorText(err), ...url ? { url } : {} });
+      }
+    }
+    async connectNotion(token, pageLink) {
+      const clean = (token ?? "").trim();
+      const pageId = parsePageId(pageLink ?? "");
+      if (!clean)
+        return this.setNotionCheck({ ok: false, message: "Paste the integration's secret first." });
+      if (!pageId) {
+        return this.setNotionCheck({
+          ok: false,
+          message: "That isn't a Notion page link. In Notion, open the page and use Share → Copy link."
+        });
+      }
+      await this.verifyNotion(clean, pageId);
+    }
+    async verifyNotion(token, pageId) {
+      this.setNotionCheck({ ok: true, message: "Checking…" });
+      try {
+        const pageTitle = await this.notionClient.pageTitle(token, pageId);
+        this.notion = { token, pageId, pageTitle };
+        this.save(STORAGE_KEYS.notion, this.notion);
+        this.setNotionCheck({ ok: true, message: `Connected. Exports go under “${pageTitle}”.` });
+      } catch (err) {
+        this.setNotionCheck({ ok: false, message: notionErrorText(err) });
+      }
+    }
+    setNotionCheck(check) {
+      this.notionCheck = check;
+      this.broadcast();
+    }
+    setExportStatus(status) {
+      this.exportStatus = status;
+      this.broadcast();
+    }
     show(text, kind) {
       this.showingKind = kind;
       this.pager.show(text);
@@ -5467,6 +5775,13 @@ ${transcriptBlock(transcript)}` };
         keyCheck: this.keyCheck,
         transcript: this.transcript.tail(TRANSCRIPT_TAIL),
         interim: this.transcript.interim,
+        heardLines: this.transcript.length,
+        notion: {
+          pageTitle: this.notion?.pageTitle ?? null,
+          tokenHint: this.notion ? `…${this.notion.token.slice(-4)}` : null,
+          check: this.notionCheck
+        },
+        exportStatus: this.exportStatus,
         replies: this.replies,
         usage: this.usage,
         status: this.status(),
@@ -5522,7 +5837,19 @@ ${transcriptBlock(transcript)}` };
       }), ui.on("key:check", () => void this.checkKey()), ui.on("ask", ({ question }) => void this.ask(question)), ui.on("brief", () => void this.brief()), ui.on("transcript:clear", () => {
         this.transcript.clear();
         this.cancelCapture();
+        this.exportStatus = null;
         this.broadcast();
+      }), ui.on("export:share", ({ utcOffsetMin }) => void this.shareTranscript(utcOffsetMin)), ui.on("export:notion", ({ utcOffsetMin }) => void this.saveToNotion(utcOffsetMin)), ui.on("notion:connect", ({ token, pageLink }) => void this.connectNotion(token, pageLink)), ui.on("notion:check", () => {
+        if (this.notion)
+          this.verifyNotion(this.notion.token, this.notion.pageId);
+      }), ui.on("notion:disconnect", () => {
+        this.notion = null;
+        this.notionCheck = null;
+        this.session.storage.delete(STORAGE_KEYS.notion).catch(() => {});
+        this.broadcast();
+      }), ui.on("url:open", ({ url }) => {
+        if (typeof url === "string" && url.startsWith("https://"))
+          this.session.system.openUrl(url);
       }), ui.on("replies:replay", ({ id }) => {
         const reply = this.replies.find((r) => r.id === id);
         if (reply)
@@ -5576,11 +5903,12 @@ ${transcriptBlock(transcript)}` };
     }
     async load() {
       const storage = this.session.storage;
-      const [settings, apiKey, replies, usage] = await Promise.all([
+      const [settings, apiKey, replies, usage, notion] = await Promise.all([
         readJson(storage.get(STORAGE_KEYS.settings)),
         storage.get(STORAGE_KEYS.apiKey).catch(() => null),
         readJson(storage.get(STORAGE_KEYS.replies)),
-        readJson(storage.get(STORAGE_KEYS.usage))
+        readJson(storage.get(STORAGE_KEYS.usage)),
+        readJson(storage.get(STORAGE_KEYS.notion))
       ]);
       if (settings && typeof settings === "object")
         this.settings = sanitizeSettings({ ...DEFAULT_SETTINGS, ...settings });
@@ -5590,6 +5918,8 @@ ${transcriptBlock(transcript)}` };
         this.replies = replies.filter(isReply).slice(0, REPLY_LIMIT);
       if (isUsage(usage))
         this.usage = usage;
+      if (isNotionTarget(notion))
+        this.notion = notion;
     }
     save(key, value) {
       this.session.storage.set(key, JSON.stringify(value)).catch((err) => {
@@ -5615,12 +5945,19 @@ ${transcriptBlock(transcript)}` };
   function errorText(err) {
     return err instanceof ClaudeError ? err.message : "Something went wrong talking to Claude.";
   }
+  function notionErrorText(err) {
+    return err instanceof NotionError ? err.message : "Something went wrong talking to Notion.";
+  }
   function emptyUsage(since) {
     return { requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, since };
   }
   function isReply(x) {
     const r = x;
     return !!r && typeof r.id === "string" && typeof r.text === "string" && typeof r.at === "number";
+  }
+  function isNotionTarget(x) {
+    const n = x;
+    return !!n && typeof n.token === "string" && typeof n.pageId === "string" && typeof n.pageTitle === "string";
   }
   function isUsage(x) {
     const u = x;
