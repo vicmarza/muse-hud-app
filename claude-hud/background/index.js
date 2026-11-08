@@ -4905,13 +4905,14 @@
     "claude-opus-5-5": "Claude Opus 5.5"
   };
   var PRICES = {
-    "claude-sonnet-5-5": { input: 2, output: 10 },
-    "claude-haiku-5-5": { input: 0.1, output: 0.5 },
-    "claude-opus-5-5": { input: 4, output: 20 }
+    "claude-sonnet-5-5": { input: 2, output: 10, cacheRead: 0.2 },
+    "claude-haiku-5-5": { input: 0.1, output: 0.5, cacheRead: 0.01 },
+    "claude-opus-5-5": { input: 4, output: 20, cacheRead: 0.2 }
   };
-  function estimateCostUsd(model, inputTokens, outputTokens) {
+  function estimateCostUsd(model, usage) {
     const price = PRICES[model];
-    return (inputTokens * price.input + outputTokens * price.output) / 1e6;
+    const dollars = usage.inputTokens * price.input + usage.cacheWriteTokens * price.input * 1.25 + usage.cacheReadTokens * price.cacheRead + usage.outputTokens * price.output;
+    return dollars / 1e6;
   }
 
   class ClaudeError extends Error {
@@ -4959,7 +4960,7 @@
         model: opts.model,
         max_tokens: opts.maxTokens,
         system: opts.system,
-        messages: [{ role: "user", content: opts.user }],
+        messages: [{ role: "user", content: userContent(opts) }],
         output_config: {
           effort: opts.effort,
           ...opts.jsonSchema ? { format: { type: "json_schema", schema: opts.jsonSchema } } : {}
@@ -5018,8 +5019,18 @@
       stopReason,
       model: data.model ?? "",
       inputTokens: data.usage?.input_tokens ?? 0,
-      outputTokens: data.usage?.output_tokens ?? 0
+      outputTokens: data.usage?.output_tokens ?? 0,
+      cacheWriteTokens: data.usage?.cache_creation_input_tokens ?? 0,
+      cacheReadTokens: data.usage?.cache_read_input_tokens ?? 0
     };
+  }
+  function userContent(opts) {
+    if (!opts.cachedUser)
+      return opts.user;
+    return [
+      { type: "text", text: opts.cachedUser, cache_control: { type: "ephemeral" } },
+      { type: "text", text: opts.user }
+    ];
   }
   function errorFor(status, raw) {
     let message = "";
@@ -5097,11 +5108,13 @@
       return this.lines.length;
     }
     text(windowMs, now) {
-      const from = now - windowMs;
+      return this.between(now - windowMs, Number.POSITIVE_INFINITY);
+    }
+    between(from, to) {
       const out = [];
       let prev = null;
       for (const line of this.lines) {
-        if (line.at < from)
+        if (line.at < from || line.at > to)
           continue;
         if (prev && line.at - prev.at >= PAUSE_MARK_MS) {
           out.push(`(${Math.round((line.at - prev.at) / 60000)} min pause)`);
@@ -5439,7 +5452,7 @@
   }
 
   // src/background/core/prompts.ts
-  var RECENT_WINDOW_MS = 10 * 60 * 1000;
+  var CONVERSATION_WINDOW_MS = 30 * 60 * 1000;
   var BRIEF_WINDOW_MS = 60 * 60 * 1000;
   var DISPLAY = `Your words appear on Even Realities G1 smart glasses: a small monochrome display that shows five short lines at a time, read at a glance while the wearer is in a conversation. Write plain sentences: no Markdown, headings, emoji, preamble or sign-off.`;
   var TRANSCRIPT = `The transcript comes from live speech recognition through the glasses' microphones. It has no speaker labels, mixes the wearer with the people around them, and contains recognition errors; read through them to what was meant.`;
@@ -5454,28 +5467,49 @@ About the wearer, in their words: ${trimmed}` : "";
 ${transcript}
 </transcript>`;
   }
-  function insightPrompt(transcript, earlier, context) {
-    const system = `You are a discreet advisor to the wearer during a live conversation. Every so often you get the latest transcript and decide whether one insight is worth interrupting them for.
+  function insightPrompt(p) {
+    const rated = [
+      ...p.feedback.useful.length ? ["Useful:", ...p.feedback.useful.map((t) => `- ${t}`)] : [],
+      ...p.feedback.notUseful.length ? ["Not useful:", ...p.feedback.notUseful.map((t) => `- ${t}`)] : []
+    ];
+    const feedback = rated.length ? `
 
-Worth showing: the answer to a question someone just asked, when you can answer it reliably; a correction when someone states a wrong fact or number; a key consideration, risk or trade-off the conversation is missing; a sharp question the wearer could ask next. Think like a chief of staff briefing an executive: high signal and decision-relevant.
+How the wearer rated earlier notes; match what they found useful and avoid what they didn't:
+${rated.join(`
+`)}` : "";
+    const system = `You are listening, through the wearer's smart glasses, to a conversation they are part of, and you can put one short note in their field of view. Speak up only when you can add something they would not get from the conversation itself. Assume they know the subject at least as well as anyone in the room, unless their profile below says otherwise: anything a sharp participant would already think is noise.
 
-Not worth showing: a restatement or summary of what was just said, generic advice, anything already covered by an earlier insight, remarks about the transcript itself. When nothing clears that bar, which is most of the time, reply with exactly NONE.
+Notes that earn a place:
+- Knowledge the room is missing: a specific fact, figure, study, guideline, precedent or name that bears on what is being discussed or decided.
+- A problem with what was said: a claim that is wrong or outdated, numbers that don't add up, two statements that contradict each other, an assumption nobody has checked.
+- A consequence nobody has drawn: a second-order effect, cost, dependency or risk that follows from what was just said or agreed.
+- A connection: something said earlier in this conversation that changes the meaning of what is being said now.
+- The question that would move things forward, when it is specific to this situation and not one anyone would ask.
 
-When something does, reply with the insight alone: at most 25 words, one or two sentences, the point first.
+Notes that don't: a restatement or summary of what was said; advice that would fit any conversation, such as clarifying roles, aligning on timelines or following up; agreement or praise; anything an earlier note covered; anything you are not confident is true.
+
+For example, "It might be worth confirming the timeline with everyone" is noise, while "40 sites at 12 patients each gives 480, short of the 600 the power calculation needs" is a note.
+
+Weigh the candidates before answering and keep at most one: the one a senior expert in the room would find new and useful right now. Usually nothing qualifies; then reply with exactly NONE. Otherwise reply with the note alone: the point first, then the specific fact or reason behind it, in at most 35 words.${feedback}
 
 ${DISPLAY}
 
-${TRANSCRIPT}${about(context)}`;
-    const shown = earlier.length ? `Insights already shown, don't repeat them:
-${earlier.map((t) => `- ${t}`).join(`
+${TRANSCRIPT}${about(p.context)}`;
+    const opening = `The conversation so far, oldest first:
+<transcript>
+`;
+    const shown = p.earlier.length ? `Notes already shown, don't repeat them:
+${p.earlier.map((t) => `- ${t}`).join(`
 `)}
 
 ` : "";
-    const user = `${shown}The conversation so far, oldest first:
-${transcriptBlock(transcript)}
+    const ask = "Look hardest at the last few minutes, and use the rest to connect and check. Reply with one note, or NONE.";
+    const tail = `${p.recent}${p.recent ? `
+` : ""}</transcript>
 
-Focus on the last few lines. Reply with one insight, or NONE.`;
-    return { system, user };
+${shown}${ask}`;
+    return p.older ? { system, cachedUser: `${opening}${p.older}
+`, user: tail } : { system, user: `${opening}${tail}` };
   }
   function questionPrompt(question, transcript, context) {
     const system = `The wearer asked you something during their day, usually out loud by starting a sentence with your name, so speech recognition may have garbled it: answer what they most likely meant. The recent conversation is included when there is one; use it when the question refers to it ("that", "what she just said", "sum this up").
@@ -5622,6 +5656,7 @@ ${transcriptBlock(transcript)}` };
     insightEverySec: 60,
     model: "claude-sonnet-5-5",
     questionEffort: "low",
+    insightEffort: "medium",
     context: "",
     summarizeExports: true,
     autoSave: true,
@@ -5634,7 +5669,8 @@ ${transcriptBlock(transcript)}` };
     replies: "replies",
     usage: "usage",
     notion: "notion",
-    utcOffsetMin: "utcOffsetMin"
+    utcOffsetMin: "utcOffsetMin",
+    insightFeedback: "insightFeedback"
   };
   var REPLY_LIMIT = 25;
   var TRANSCRIPT_TAIL = 12;
@@ -5646,6 +5682,8 @@ ${transcriptBlock(transcript)}` };
   var TICK_MS = 5000;
   var MAX_BACKOFF_MS = 5 * 60 * 1000;
   var EARLIER_INSIGHTS = 6;
+  var FEEDBACK_EXAMPLES = 6;
+  var INSIGHT_CACHE_SPAN_MS = 10 * 60 * 1000;
   var UI_INTERIM_THROTTLE_MS = 400;
   var NOTES_TIMEOUT_MS = 120000;
   var AUTO_SAVE_MIN_WORDS = 30;
@@ -5695,6 +5733,9 @@ ${transcriptBlock(transcript)}` };
     questionHeardAt = 0;
     insightFailures = 0;
     backoffUntil = 0;
+    insightFrom = 0;
+    insightSplitAt = 0;
+    feedback = { useful: [], notUseful: [] };
     keyRejected = false;
     constructor(session, deps = defaultDeps()) {
       this.session = session;
@@ -5816,7 +5857,7 @@ ${transcriptBlock(transcript)}` };
       const q = question.replace(/\s+/g, " ").trim();
       if (!q)
         return;
-      const transcript = this.transcript.text(RECENT_WINDOW_MS, this.deps.now());
+      const transcript = this.transcript.text(CONVERSATION_WINDOW_MS, this.deps.now());
       await this.request("question", questionPrompt(q, transcript, this.settings.context), q);
     }
     async brief() {
@@ -5839,7 +5880,7 @@ ${transcriptBlock(transcript)}` };
       this.showStatus(STATUS_THINKING);
       try {
         const reply = await this.client.ask(apiKey, { ...prompt, model: this.settings.model, effort: this.settings.questionEffort, maxTokens: 8192 }, 1);
-        this.countUsage(reply.inputTokens, reply.outputTokens);
+        this.countUsage(reply);
         this.lastError = null;
         const text = cleanText(reply.text);
         this.addReply({ id: crypto.randomUUID(), at: this.deps.now(), kind, ...question ? { question } : {}, text });
@@ -5883,11 +5924,21 @@ ${transcriptBlock(transcript)}` };
       this.insightInFlight = true;
       this.lastCheckAt = now;
       const earlier = this.replies.filter((r) => r.kind === "insight").slice(0, EARLIER_INSIGHTS).map((r) => r.text);
-      const prompt = insightPrompt(this.transcript.text(RECENT_WINDOW_MS, now), earlier, this.settings.context);
+      const prompt = insightPrompt({
+        ...this.insightTranscript(now),
+        earlier,
+        feedback: this.feedback,
+        context: this.settings.context
+      });
       this.broadcast();
       try {
-        const reply = await this.client.ask(apiKey, { ...prompt, model: this.settings.model, effort: "low", maxTokens: 4096 });
-        this.countUsage(reply.inputTokens, reply.outputTokens);
+        const reply = await this.client.ask(apiKey, {
+          ...prompt,
+          model: this.settings.model,
+          effort: this.settings.insightEffort,
+          maxTokens: 8192
+        });
+        this.countUsage(reply);
         this.insightFailures = 0;
         this.lastError = null;
         const insight = parseInsight(reply.text);
@@ -5906,6 +5957,38 @@ ${transcriptBlock(transcript)}` };
         this.insightInFlight = false;
         this.broadcast();
       }
+    }
+    insightTranscript(now) {
+      if (!this.insightSplitAt || now - this.insightSplitAt > INSIGHT_CACHE_SPAN_MS) {
+        this.insightFrom = now - CONVERSATION_WINDOW_MS;
+        this.insightSplitAt = now;
+      }
+      return {
+        older: this.transcript.between(this.insightFrom, this.insightSplitAt),
+        recent: this.transcript.between(this.insightSplitAt + 1, Number.POSITIVE_INFINITY)
+      };
+    }
+    rateInsight(id, rating) {
+      const reply = this.replies.find((r) => r.id === id && r.kind === "insight");
+      if (!reply)
+        return;
+      this.replies = this.replies.map((r) => {
+        if (r.id !== id)
+          return r;
+        const { rating: _old, ...rest } = r;
+        return rating ? { ...rest, rating } : rest;
+      });
+      const without = (list) => list.filter((t) => t !== reply.text);
+      const useful = without(this.feedback.useful);
+      const notUseful = without(this.feedback.notUseful);
+      if (rating === "useful")
+        useful.unshift(reply.text);
+      if (rating === "not_useful")
+        notUseful.unshift(reply.text);
+      this.feedback = { useful: useful.slice(0, FEEDBACK_EXAMPLES), notUseful: notUseful.slice(0, FEEDBACK_EXAMPLES) };
+      this.save(STORAGE_KEYS.replies, this.replies);
+      this.save(STORAGE_KEYS.insightFeedback, this.feedback);
+      this.broadcast();
     }
     coveringAnswer() {
       return this.asking > 0 || this.capture !== null || this.showingKind === "question" || this.showingKind === "brief";
@@ -6021,7 +6104,7 @@ ${transcriptBlock(transcript)}` };
           jsonSchema: NOTES_SCHEMA,
           timeoutMs: NOTES_TIMEOUT_MS
         }, 1);
-        this.countUsage(reply.inputTokens, reply.outputTokens);
+        this.countUsage(reply);
         const notes = parseNotes(reply.text, doc.lines.length);
         return notes ? { notes, issue: null } : { notes: null, issue: "Claude's notes came back in an unexpected shape." };
       } catch (err) {
@@ -6186,7 +6269,7 @@ ${transcriptBlock(transcript)}` };
         const reply = this.replies.find((r) => r.id === id);
         if (reply)
           this.show(reply.text, reply.kind);
-      }), ui.on("replies:clear", () => {
+      }), ui.on("replies:rate", ({ id, rating }) => this.rateInsight(id, rating)), ui.on("replies:clear", () => {
         this.replies = [];
         this.save(STORAGE_KEYS.replies, this.replies);
         this.broadcast();
@@ -6222,26 +6305,27 @@ ${transcriptBlock(transcript)}` };
       this.replies = [reply, ...this.replies].slice(0, REPLY_LIMIT);
       this.save(STORAGE_KEYS.replies, this.replies);
     }
-    countUsage(inputTokens, outputTokens) {
+    countUsage(reply) {
       const u = this.usage;
       this.usage = {
         ...u,
         requests: u.requests + 1,
-        inputTokens: u.inputTokens + inputTokens,
-        outputTokens: u.outputTokens + outputTokens,
-        costUsd: u.costUsd + estimateCostUsd(this.settings.model, inputTokens, outputTokens)
+        inputTokens: u.inputTokens + reply.inputTokens + reply.cacheWriteTokens + reply.cacheReadTokens,
+        outputTokens: u.outputTokens + reply.outputTokens,
+        costUsd: u.costUsd + estimateCostUsd(this.settings.model, reply)
       };
       this.save(STORAGE_KEYS.usage, this.usage);
     }
     async load() {
       const storage = this.session.storage;
-      const [settings, apiKey, replies, usage, notion, utcOffsetMin] = await Promise.all([
+      const [settings, apiKey, replies, usage, notion, utcOffsetMin, feedback] = await Promise.all([
         readJson(storage.get(STORAGE_KEYS.settings)),
         storage.get(STORAGE_KEYS.apiKey).catch(() => null),
         readJson(storage.get(STORAGE_KEYS.replies)),
         readJson(storage.get(STORAGE_KEYS.usage)),
         readJson(storage.get(STORAGE_KEYS.notion)),
-        readJson(storage.get(STORAGE_KEYS.utcOffsetMin))
+        readJson(storage.get(STORAGE_KEYS.utcOffsetMin)),
+        readJson(storage.get(STORAGE_KEYS.insightFeedback))
       ]);
       if (settings && typeof settings === "object")
         this.settings = sanitizeSettings({ ...DEFAULT_SETTINGS, ...settings });
@@ -6254,6 +6338,7 @@ ${transcriptBlock(transcript)}` };
       this.notion = notionConnection(notion);
       if (typeof utcOffsetMin === "number")
         this.phoneUtcOffset = sanitizeOffset(utcOffsetMin);
+      this.feedback = insightFeedback(feedback);
     }
     save(key, value) {
       this.session.storage.set(key, JSON.stringify(value)).catch((err) => {
@@ -6269,6 +6354,7 @@ ${transcriptBlock(transcript)}` };
       insightEverySec: clamp(s.insightEverySec, 20, 600, DEFAULT_SETTINGS.insightEverySec),
       model: MODELS.includes(s.model) ? s.model : DEFAULT_SETTINGS.model,
       questionEffort: EFFORTS.includes(s.questionEffort) ? s.questionEffort : DEFAULT_SETTINGS.questionEffort,
+      insightEffort: EFFORTS.includes(s.insightEffort) ? s.insightEffort : DEFAULT_SETTINGS.insightEffort,
       context: typeof s.context === "string" ? s.context.slice(0, CONTEXT_CHARS) : "",
       summarizeExports: s.summarizeExports !== false,
       autoSave: s.autoSave !== false,
@@ -6287,6 +6373,11 @@ ${transcriptBlock(transcript)}` };
   }
   function notionErrorText(err) {
     return err instanceof NotionError ? err.message : "Something went wrong talking to Notion.";
+  }
+  function insightFeedback(x) {
+    const f = x;
+    const strings = (v) => Array.isArray(v) ? v.filter((t) => typeof t === "string").slice(0, FEEDBACK_EXAMPLES) : [];
+    return { useful: strings(f?.useful), notUseful: strings(f?.notUseful) };
   }
   function emptyUsage(since) {
     return { requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, since };
