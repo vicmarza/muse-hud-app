@@ -5633,7 +5633,11 @@ ${transcriptBlock(transcript)}` };
   var AFTER_NAME = String.raw`\b(?!['’]s\b)([,.:;!?]*)\s*`;
   var WAKE = new RegExp(`${SENTENCE_START}(?:${GREETING})?${NAME}${AFTER_NAME}`, "i");
   var WAKE_GREETED = new RegExp(`${SENTENCE_START}${GREETING}cloud${AFTER_NAME}`, "i");
-  var ASK_START = /^(?:what|what's|whats|who|who's|whose|whom|why|how|how's|when|where|which|is|are|was|were|am|can|could|should|would|will|do|does|did|has|have|tell|give|summarize|summarise|brief|explain|define|translate|remind|help|list|compare|calculate|convert|find|suggest|recap|any|please)\b/i;
+  var ASK_START = /^(?:what|what's|whats|who|who's|whose|whom|why|how|how's|when|where|which|is|are|was|were|am|can|could|should|would|will|do|does|did|has|have|tell|give|summarize|summarise|brief|explain|define|translate|remind|help|list|compare|calculate|convert|find|suggest|recap|any|please|pause|mute|stop)\b/i;
+  var PAUSE = /^(?:please\s+)?(?:pause(?:\s+listening)?|stop\s+listening|mute(?:\s+yourself)?)(?:\s+(?:please|for\s+now|for\s+an\s+hour|for\s+one\s+hour))?[\s.!,]*$/i;
+  function isPauseCommand(text) {
+    return PAUSE.test(text.trim());
+  }
   function findWake(text) {
     for (const re of [WAKE, WAKE_GREETED]) {
       const match = re.exec(text);
@@ -5670,7 +5674,8 @@ ${transcriptBlock(transcript)}` };
     usage: "usage",
     notion: "notion",
     utcOffsetMin: "utcOffsetMin",
-    insightFeedback: "insightFeedback"
+    insightFeedback: "insightFeedback",
+    pausedUntil: "pausedUntil"
   };
   var REPLY_LIMIT = 25;
   var TRANSCRIPT_TAIL = 12;
@@ -5684,6 +5689,8 @@ ${transcriptBlock(transcript)}` };
   var EARLIER_INSIGHTS = 6;
   var FEEDBACK_EXAMPLES = 6;
   var INSIGHT_CACHE_SPAN_MS = 10 * 60 * 1000;
+  var PAUSE_MINUTES = 60;
+  var MAX_PAUSE_MS = 4 * 60 * 60 * 1000;
   var UI_INTERIM_THROTTLE_MS = 400;
   var NOTES_TIMEOUT_MS = 120000;
   var AUTO_SAVE_MIN_WORDS = 30;
@@ -5723,6 +5730,7 @@ ${transcriptBlock(transcript)}` };
     phoneUtcOffset = null;
     unsubs = [];
     stopTranscription = null;
+    pausedUntil = 0;
     tickTimer = null;
     showingKind = null;
     lastInterimBroadcast = 0;
@@ -5778,15 +5786,41 @@ ${transcriptBlock(transcript)}` };
       for (const unsub of this.unsubs.splice(0))
         unsub();
     }
+    isPaused() {
+      return this.pausedUntil > this.deps.now();
+    }
+    listeningNow() {
+      return this.settings.listening && !this.isPaused();
+    }
     applyListening() {
-      if (this.settings.listening && !this.stopTranscription) {
+      const listen = this.listeningNow();
+      if (listen && !this.stopTranscription) {
         this.stopTranscription = this.session.transcription.on((data) => this.onTranscription(data));
         this.lastCheckAt = this.deps.now();
-      } else if (!this.settings.listening && this.stopTranscription) {
+      } else if (!listen && this.stopTranscription) {
         this.stopTranscription();
         this.stopTranscription = null;
         this.cancelCapture();
       }
+    }
+    pauseListening(minutes, byVoice = false) {
+      const now = this.deps.now();
+      const from = Math.max(now, this.pausedUntil);
+      this.pausedUntil = Math.min(now + MAX_PAUSE_MS, from + clamp(minutes, 1, 240, PAUSE_MINUTES) * 60000);
+      this.save(STORAGE_KEYS.pausedUntil, this.pausedUntil);
+      this.applyListening();
+      if (byVoice) {
+        this.show(`Listening paused until ${clock(this.pausedUntil, this.utcOffsetMin())}. Resume it in Claude HUD on your phone.`, "notice");
+      }
+      this.broadcast();
+    }
+    resumeListening() {
+      if (!this.pausedUntil)
+        return;
+      this.pausedUntil = 0;
+      this.save(STORAGE_KEYS.pausedUntil, 0);
+      this.applyListening();
+      this.broadcast();
     }
     onTranscription(data) {
       const now = this.deps.now();
@@ -5839,6 +5873,10 @@ ${transcriptBlock(transcript)}` };
         return;
       this.deps.scheduler.clear(capture.timer);
       this.capture = null;
+      if (isPauseCommand(capture.text)) {
+        this.pauseListening(PAUSE_MINUTES, true);
+        return;
+      }
       if (countWords(capture.text) < 2) {
         if (this.showingKind === "status")
           this.pager.stop();
@@ -5898,6 +5936,8 @@ ${transcriptBlock(transcript)}` };
     }
     scheduleTick() {
       this.tickTimer = this.deps.scheduler.set(() => {
+        if (this.pausedUntil && !this.isPaused())
+          this.resumeListening();
         this.maybeCheckInsight();
         this.maybeAutoSave();
         this.scheduleTick();
@@ -5905,7 +5945,7 @@ ${transcriptBlock(transcript)}` };
     }
     maybeCheckInsight() {
       const s = this.settings;
-      if (!s.listening || !s.autoInsights || !this.apiKey || this.keyRejected)
+      if (!this.listeningNow() || !s.autoInsights || !this.apiKey || this.keyRejected)
         return;
       if (this.insightInFlight || this.asking > 0 || this.capture)
         return;
@@ -6189,6 +6229,7 @@ ${transcriptBlock(transcript)}` };
         transcript: this.transcript.tail(TRANSCRIPT_TAIL),
         interim: this.transcript.interim,
         heardLines: this.transcript.length,
+        pausedUntil: this.isPaused() ? this.pausedUntil : null,
         unsavedLines: this.notion ? this.unsavedLines().length : 0,
         notion: {
           title: this.notion?.target.title ?? null,
@@ -6217,6 +6258,8 @@ ${transcriptBlock(transcript)}` };
         return "Listening for your question…";
       if (!this.settings.listening)
         return "Not listening";
+      if (this.isPaused())
+        return `Paused until ${clock(this.pausedUntil, this.utcOffsetMin())}`;
       if (this.insightInFlight)
         return "Looking for an insight…";
       return this.settings.autoInsights ? "Listening" : "Listening for “Claude, …”";
@@ -6249,7 +6292,7 @@ ${transcriptBlock(transcript)}` };
         this.keyRejected = false;
         this.session.storage.delete(STORAGE_KEYS.apiKey).catch(() => {});
         this.broadcast();
-      }), ui.on("key:check", () => void this.checkKey()), ui.on("ask", ({ question }) => void this.ask(question)), ui.on("brief", () => void this.brief()), ui.on("transcript:clear", () => this.clearTranscript()), ui.on("clock", ({ utcOffsetMin }) => {
+      }), ui.on("key:check", () => void this.checkKey()), ui.on("ask", ({ question }) => void this.ask(question)), ui.on("brief", () => void this.brief()), ui.on("transcript:clear", () => this.clearTranscript()), ui.on("listening:pause", ({ minutes }) => this.pauseListening(minutes)), ui.on("listening:resume", () => this.resumeListening()), ui.on("clock", ({ utcOffsetMin }) => {
         if (!Number.isFinite(utcOffsetMin))
           return;
         this.phoneUtcOffset = sanitizeOffset(utcOffsetMin);
@@ -6318,14 +6361,15 @@ ${transcriptBlock(transcript)}` };
     }
     async load() {
       const storage = this.session.storage;
-      const [settings, apiKey, replies, usage, notion, utcOffsetMin, feedback] = await Promise.all([
+      const [settings, apiKey, replies, usage, notion, utcOffsetMin, feedback, pausedUntil] = await Promise.all([
         readJson(storage.get(STORAGE_KEYS.settings)),
         storage.get(STORAGE_KEYS.apiKey).catch(() => null),
         readJson(storage.get(STORAGE_KEYS.replies)),
         readJson(storage.get(STORAGE_KEYS.usage)),
         readJson(storage.get(STORAGE_KEYS.notion)),
         readJson(storage.get(STORAGE_KEYS.utcOffsetMin)),
-        readJson(storage.get(STORAGE_KEYS.insightFeedback))
+        readJson(storage.get(STORAGE_KEYS.insightFeedback)),
+        readJson(storage.get(STORAGE_KEYS.pausedUntil))
       ]);
       if (settings && typeof settings === "object")
         this.settings = sanitizeSettings({ ...DEFAULT_SETTINGS, ...settings });
@@ -6339,6 +6383,8 @@ ${transcriptBlock(transcript)}` };
       if (typeof utcOffsetMin === "number")
         this.phoneUtcOffset = sanitizeOffset(utcOffsetMin);
       this.feedback = insightFeedback(feedback);
+      if (typeof pausedUntil === "number" && pausedUntil > this.deps.now())
+        this.pausedUntil = pausedUntil;
     }
     save(key, value) {
       this.session.storage.set(key, JSON.stringify(value)).catch((err) => {
